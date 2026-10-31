@@ -1,0 +1,92 @@
+# The hosted data plane: one process serving every tenant the control
+# plane publishes, routed by hostname.
+#
+#   apip-fleet check examples/fleet.yml     # before you deploy it
+#   apip-fleet run   examples/fleet.yml
+#
+# This is not examples/maat.yml. That one puts a document in front of an
+# upstream and is what a customer runs; this one is told what it serves.
+
+control_plane:  https://openapi-proxy.com
+registry_token: { $env: APIP_REGISTRY_TOKEN }   # the control plane's MAAT_REGISTRY_TOKEN
+
+listen:
+  # Plain :80 serves the router rather than redirecting. A customer's
+  # custom domain is validated over plain HTTP before its certificate
+  # exists, and a redirect_https listener answers every request in C
+  # before the application is reached - including the challenge.
+  - { port: 80 }
+
+  # The tenant zone's wildcard. It covers every <slug>.openapi-proxy.com;
+  # a wildcard needs DNS-01, since HTTP-01 cannot issue one. Customers'
+  # custom domains are different - they arrive already issued, in the
+  # bundle, and are served over SNI without appearing here.
+  - { port: 443,
+      tls_cert: /etc/letsencrypt/live/openapi-proxy.com/fullchain.pem,
+      tls_key:  /etc/letsencrypt/live/openapi-proxy.com/privkey.pem }
+
+workers:  4
+interval: 15                 # seconds between bundle polls
+
+# Serve a customer's certificate the poll after it is issued, instead of
+# the restart after it is issued. A listener's SSL context is built once,
+# before the first fork, so without this a domain that is verified,
+# issued and routed still fails the handshake until this process is
+# replaced - and SIGHUP does not help, since it re-forks from that same
+# parent. On by default; needs Hyperman 0.15, and does nothing on a fleet
+# with no TLS listener of its own.
+# tls_reload: false
+
+# What this worker will hold. A miss recompiles from the spec it already
+# has the digest for, so the cap is a memory decision, not a correctness
+# one.
+max_specs: 1000
+max_bytes: 256M
+compile_budget:
+  seconds:        5
+  max_spec_bytes: 5M
+
+# Blast radius. Uncomment both to run a fleet rather than a box: free and
+# anon tenants land on free-* pools, paying ones on paid-*, so a pasted
+# spec from a stranger never shares a process with a customer.
+# pools: { paid: 4, free: 2 }
+# pool:  paid-0
+
+# Real paths, because the defaults are temporary directories: domain
+# certificates from the bundle are written here for SNI, and the rate
+# limiter's counters live here so this box's workers share them.
+tls_dir: /var/lib/maat/tls
+rl_dir:  /var/lib/maat/rl
+
+# One violation spool per tenant, under here. Without it a tenant still
+# meters and still reports coverage - both are running totals the next
+# drain restates - but violation records have nowhere durable to wait
+# when the control plane is having a bad minute, so they are dropped
+# rather than queued.
+spool_dir: /var/lib/maat/spool
+
+# What this fleet says about itself, and where.
+#
+# `log` puts one JSON object per line on STDERR for the things worth
+# knowing: a poll that was not a 304, a bundle's added and removed
+# tenants, and - the pair that matters - a compile start and its
+# terminator. A `compile` start with no `ok` or `fail` beside it is a
+# compile that never came back, and finding that took an evening before
+# there was a line for it. STDERR is where both supervisors already
+# look: fleet_server redirects it here, systemd sends it to journald.
+log: true
+
+# Counters, per worker, written here every interval and read by
+# `apip-fleet stats`. A file rather than an endpoint for two reasons:
+# this fleet serves arbitrary customer hostnames, so a metrics PATH
+# would shadow some tenant's real route - and a file is still readable
+# when a worker is too busy to answer HTTP, which is the state most
+# worth inspecting. Never summed across workers: each keeps its own
+# registry and polls on its own timer, and when they disagree that
+# disagreement IS the finding.
+stats_dir: /var/lib/maat/stats
+
+# Where a tenant's violations ship, under the tenant's own report token.
+# Without this nothing leaves the process.
+report_url:  https://openapi-proxy.com/ingest/violations
+environment: production

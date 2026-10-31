@@ -1,0 +1,46 @@
+NAME
+    Maat - a spec-enforcing reverse proxy for OpenAPI
+
+SYNOPSIS
+        # maat.yml
+        upstream: https://api.internal:8443
+        spec:     ./openapi.json
+        mode:     observe
+
+        $ maat check maat.yml      # the spec compiles, the upstream answers
+        $ maat run   maat.yml
+
+DESCRIPTION
+    Put an OpenAPI document in front of an existing API. Every request is
+    matched against the document and validated against it before it is
+    forwarded; what the document does not describe is forwarded anyway and
+    counted. In "enforce" mode a request that does not conform is answered
+    with "application/problem+json" and never reaches the upstream; in
+    "observe" mode it is recorded and forwarded untouched.
+
+    This distribution is the data plane of <https://openapi-proxy.com>. It
+    is a composition rather than an engine: Open::API compiles the document
+    and validates in C, Reverse::Proxy forwards in C through Fetch's ABI,
+    and this code is the policy between them.
+
+  Fail-open
+    Maat sits in a request path that is not its own. Every call into
+    validation is wrapped, and a failure inside Maat - a validator that
+    dies, a spec handle that has gone, a recorder that will not answer -
+    loses the check, never the request. The "MAAT_CHAOS" environment
+    variable injects exactly those failures on purpose, so the property is
+    tested rather than asserted. See "CHAOS" in Maat::Gateway.
+
+SEE ALSO
+    Maat::Gateway, Maat::Config, Open::API, Reverse::Proxy.
+
+AUTHOR
+    LNATION <email@lnation.org>
+
+LICENSE AND COPYRIGHT
+    This software is Copyright (c) 2026 by LNATION <email@lnation.org>.
+
+    This is free software, licensed under:
+
+      The Artistic License 2.0 (GPL Compatible)
+

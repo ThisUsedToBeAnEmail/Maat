@@ -1,0 +1,26 @@
+# A gateway in front of an existing API.
+#
+#   maat check examples/maat.yml     # before you deploy it
+#   maat run   examples/maat.yml
+
+upstream: http://127.0.0.1:8081      # the API you already have
+spec:     ./openapi.json             # the document it claims to implement
+
+# observe records violations and changes nothing about the traffic.
+# enforce additionally answers a non-conforming REQUEST itself, with
+# problem+json, and never forwards it. Start with observe.
+mode: observe
+
+listen:
+  - { port: 8080 }
+  # - { port: 80,  redirect_https: 443 }
+  # - { port: 443, tls_cert: tls/server.crt, tls_key: tls/server.key }
+
+# Bodies larger than this are forwarded without being validated, rather
+# than buffered. The check is skipped and counted; nothing is delayed.
+max_body: 1M
+
+# Where violations go in phase 3. A token never has to be written here:
+# report:
+#   url:   https://openapi-proxy.com/v1/violations
+#   token: { $env: MAAT_TOKEN }

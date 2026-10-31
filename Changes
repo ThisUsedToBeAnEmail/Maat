@@ -1,0 +1,740 @@
+Revision history for Maat
+
+0.06    Unreleased
+        - Maat::MCP::Tools: the tools a proxied document offers an agent,
+          derived once at compile time from the same Open::API object the
+          gateway enforces. Needs Open::API 0.13 for operation_schema and
+          operation_doc.
+        - Maat::MCP: an MCP endpoint at /mcp on the gateway itself, off
+          unless a tenant enables it. One JSON-RPC message per POST:
+          initialize, ping, tools/list, tools/call. tools/list answers
+          from bytes frozen at compile time. A tools/call IS a request
+          through the gateway: it re-enters the same C entry a customer's
+          own client reaches, so it is matched, validated, metered and
+          forwarded exactly once. Arguments are checked against the tool
+          schema first, so a refused call costs the tenant nothing.
+        - Maat::MCP authenticates. The tenant's own API keys are bearer
+          tokens at /mcp, hashed and compared in constant time against
+          the keys already on the environment, so there is no second
+          lookup and a revoked key dies with the next bundle. A key needs
+          the `mcp` scope, or no scopes at all. Missing or unknown is 401
+          with a WWW-Authenticate naming the metadata document; a key
+          without the scope is 403. A tenant publishing no keys is open,
+          the same stance the API path takes.
+        - The RFC 9728 protected-resource document is served at
+          /.well-known/oauth-protected-resource, built once per tenant
+          and public, because it is what tells a client how to
+          authenticate. It names an authorization server only when the
+          tenant is configured for OAuth.
+        - A tool call carries the key the endpoint resolved, so it is
+          rate limited and metered per key like any other request, and
+          _authorize trusts it rather than re-checking a credential the
+          gateway never stored.
+        - OAuth 2.1 access tokens at /mcp, verified statelessly against
+          the authorization server's public keys. The registry bundle
+          carries a top-level `jwks`, held once per worker rather than
+          per tenant and replaced wholesale by each poll, so a key
+          rotation lands on the next bundle without recompiling a
+          tenant. A token must be signed by one of those keys, name this
+          gateway's issuer, carry this endpoint's canonical resource as
+          its audience, be in date, hold the `mcp` scope and name this
+          tenant. Its `apip_key` claim resolves against the tenant's
+          published keys, so revoking a key kills a live token on the
+          next bundle, and the client's token never goes upstream.
+        - A tenant configured for OAuth whose keys are all revoked now
+          refuses every request rather than falling back to open. A
+          keys-only tenant with no keys is still open, as the API path
+          is.
+        - apip gains `mcp`: `apip mcp PROXY` shows whether the endpoint
+          is on and whether it is actually being served, `on`/`off`
+          toggle it (with `--ops` choosing which operations are offered
+          as tools), and `tools` lists what an agent would be shown.
+        - apip gains `examples`, reaching the mock examples the console
+          already offered: list them, set one from a file or stdin,
+          remove one. With `mcp` this closes the last operations the
+          published document declared that no command could reach, so
+          t/27-cli-parity.t passes whole.
+        - Tool calls are metered. A tools/call re-enters the gateway, so
+          it was already billed as the request it is; a new `mcp`
+          counter beside `request` says how many of an hour's requests
+          an agent made, and both totals ride in the SAME usage entry
+          because the control plane replaces that row rather than adding
+          to it. tools/list, initialize and ping are not metered: a
+          client lists on every session it opens, and billing that would
+          charge a customer for an agent connecting.
+        - An MCP-only rate limit: at most 300 tool calls per key per
+          minute across every tool, overridable per key with
+          `mcp_calls_per_min`. The per-operation limit buckets by (key,
+          operation), so an agent calling sixty different cheap tools
+          once a second tripped none of them. A refused call is answered
+          as a tool error carrying `_meta.retry_after`, so the model
+          waits instead of retrying in a loop, and it never becomes a
+          request.
+        - tools/list is paged at 50 tools, with an opaque cursor and no
+          cursor on the last page. The pages are frozen when the tenant
+          compiles, exactly as the single list was, so a document with
+          four hundred operations costs a client one more round trip and
+          this gateway nothing per request. A tenant with fewer than 50
+          tools answers byte for byte what it did before.
+        - A violation records the tool an agent called. Attribution
+          only: `tool` is deliberately not part of the fingerprint,
+          because the same drift reached through two tools is one drift
+          in the upstream.
+        - Requires Reverse::Proxy 0.06, raised from 0.03. 0.04 is the
+          release that re-encodes the forwarded request target, without
+          which a client URL carrying %0d%0a reached the upstream as a
+          real CRLF and started a second, attacker-written request on
+          that connection: request smuggling past everything this
+          gateway enforces.
+        - `apip-fleet check` says which tenants answer /mcp and how an
+          agent authenticates to them. It reads the bundle, so a proxy
+          switched on below the plan that carries it is reported off,
+          which is what it will be.
+        - bench/mcp.pl: what the agent endpoint costs. Turning MCP on
+          does not move the API path (within noise on a 30,000 iteration
+          best-of-7), and a tool call costs ~4.4us over the same request
+          made directly. bench/RESULTS.md carries the block.
+        - FIX: the first MCP request to reach a fleet through the
+          dispatcher warned "uninitialized value", because Maat::Router
+          seeded every counter the C increments except `mcp`. Nothing
+          caught it: every MCP test drove the endpoint directly rather
+          than the route to it, which is now covered in t/20-router.t.
+        - FIX: the request-validation path could corrupt the Perl stack
+          on perls before 5.32. When validate_env returned exactly one
+          value, mt_serve read it with SvTRUE(POPs); SvTRUE evaluated its
+          argument more than once until 5.32, so POPs fired once per
+          expansion and walked the stack pointer below the stack base.
+          The two-value branch beside it already popped into a temporary
+          and was correct. Found by sweeping every dist for the pattern
+          after the same bug crashed Punk::OpenTelemetry 0.03 on a
+          smoker.
+        Phase 10 of plan_maat, the gateway half: the docs portal. Published
+        documentation rendered from the SAME compiled spec the gateway is
+        enforcing, so the docs and the runtime cannot disagree - one
+        artifact is documented, enforced and measured. Off by default: with
+        no `portal` in the gateway config there is no /docs route at all,
+        and the request path is the phase 1-9 path byte for byte.
+
+        - Maat::Portal: a per-tenant/host docs site served at /docs on the
+          gateway itself. Rendered ONCE, at compile time, off the request
+          path in Maat::Registry - the generated reference (Open::API::UI),
+          the prose guides (Markdown::Simple), the per-operation client
+          snippets and the Search::Trigram index are all boot work. A
+          request into /docs is then a hash lookup into frozen bytes, not a
+          template run: the `renders` counter does not move on a request.
+        - The spec version and its content hash ride on every page, so a
+          reader always knows which contract they are reading. The version
+          and digest are exactly the pair Maat::Registry holds and the
+          router stamps on X-Maat-Version, so the docs and the enforced
+          spec move together - change the spec and both move (gate 1).
+        - Prose guides fetched lazily from their revision, the exact mirror
+          of the spec fetch: Maat::Registry gains `fetch_guides` (a coderef
+          proxy-id -> { rev, guides }), called only when a tenant's
+          portal.guides_rev is non-empty, cached per proxy. A guides_rev or
+          badges change with the spec digest unchanged rebuilds only that
+          tenant's frozen portal, off the request path, on its next request.
+        - Search across the reference and the prose through Search::Trigram,
+          the index built at boot from the same frozen content and queried
+          at /docs/search.
+        - The reality badge, the differentiator: per operation, a badge
+          from THIS gateway's own local drift aggregates. Maat::Violation
+          gains a standing per-operation `drift` view (not cleared on
+          flush) that records which operations' responses have violated
+          their schema; the badge reads exactly that, so it equals what the
+          pipeline holds by construction, and because the same aggregates
+          ship to the control plane it reconciles with the control plane's
+          drift view (gate 3). Gated by the tenant's portal.badges opt-in:
+          off, no badge is ever rendered and /docs/reality.json reports
+          nothing.
+        - Generated client snippets per operation - curl and
+          Open::API::Client - from the compiled spec, with path templates
+          filled from the declared parameter schemas, curl highlighted
+          through Eshu.
+        - Maat::Config gains a `portal` key (default off, the gate) and
+          Maat::Registry a `portal` switch and `fetch_guides` fetcher. With
+          the portal off the tenant app is returned bare - no wrapper, no
+          /docs route, not one added op on the API request path (gate 4).
+        - t/27-portal.t: 63 tests covering the four gates and the portal's
+          own surface. `prove -lb t/` is 836 tests green.
+
+        FIX: the spec fetcher wedged a worker instead of waiting. It
+        built a loop-less Fetch agent, which inside a Hyperman worker
+        puts the request's fd on a private standalone loop while
+        Fetch::Future->get pumps the ACTIVE one - so the request is never
+        registered with the loop being pumped, never completes, and its
+        timeout never fires either, because the timer is on the abandoned
+        loop too. Maat::Poller::_ua carries this warning already; the
+        fetcher was the next thing to hit it.
+
+        It presented as a fleet that worked and then did not: a tenant
+        compiled earlier kept serving, a tenant whose FIRST request
+        landed there never answered at all, and every worker looked
+        healthy in ps because a wedged one spins a loop rather than
+        blocking in a syscall. The agent now shares the worker's loop,
+        and is rebuilt when the pid changes - it is created in the parent
+        and inherited, so one made before the fork shared its socket with
+        every sibling, which Maat::Poller::arm has always guarded against
+        and this did not.
+
+        And the fleet now says what it is doing, which is why the above
+        took an evening to find rather than a minute.
+
+        - Maat::Log: one JSON object per line on STDERR, where both
+          supervisors already look. Off unless enabled, so a library
+          caller writes nothing uninvited; never dies and never warns,
+          because every call site is a failure path and an emitter that
+          throws inside an error handler turns a bad minute into an
+          outage.
+        - The events are the ones that were missing when they were
+          wanted: `compile` start and its terminator with a duration (a
+          start with neither `ok` nor `fail` beside it is a compile that
+          never came back), `poison` with the reason, `bundle` as an
+          added/removed diff rather than a total, `fetch` failures with
+          the URL, `poll` for every result except not_modified - four
+          workers on a fifteen-second timer would otherwise write a line
+          every four seconds saying nothing happened.
+        - The per-request facts stay counters. A line per unknown host is
+          a log-flooding lever any stranger can pull with a made-up
+          hostname.
+        - `stats_dir` and `apip-fleet stats`: each worker writes its
+          counters to a file, atomically, at most once an interval. A
+          file rather than an endpoint because this fleet serves
+          arbitrary customer hostnames - any metrics PATH would shadow
+          some tenant's real route - and because a file is still readable
+          when a worker is too busy to answer HTTP. Per worker and never
+          summed: they keep their own registries and poll on their own
+          timers, and when they disagree the command says so, which is
+          the shape of a worker still serving its boot-time tenant table.
+          A worker that stopped reporting is shown stale, not counted.
+        - `apip-fleet check` names the cost of running without either.
+
+        A certificate issued after the fleet started is now served the
+        poll after it is issued, rather than the restart after. It was
+        the last manual step in an otherwise automatic custom-domain
+        lifecycle, and an invisible one: the domain verified, issued,
+        routed and read "live" in the console while the customer's
+        client still failed the handshake.
+
+        - Maat::Registry tracks a digest of each domain's certificate
+          bytes and bumps tls_generation when the set changes - a domain
+          added, removed, or RENEWED. A renewal is the same host at the
+          same derived path with different bytes, so a path comparison
+          would have missed the case that matters most. `on_tls_change`
+          is called with the new SNI map when it moves and not
+          otherwise, which is what stops a stable fleet rebuilding an
+          SSL context every fifteen seconds for nothing.
+        - Maat::Fleet wires that to Hyperman->tls_reload (0.15), which
+          rebuilds the worker's context in place: nothing unbound, no
+          connection refused, each worker picking it up as its own poll
+          comes round. Wired only with a TLS listener of this fleet's
+          own and only when the installed Hyperman has the call, so a
+          balancer deployment costs nothing and an older Hyperman
+          degrades to needing the restart. `tls_reload: false` in
+          fleet.yml turns it off.
+
+        Maat::Fleet, and with it a hosted data plane that exists. Phases
+        6 and 7 left Registry, Poller, Router and Shard as four tested
+        libraries with nothing owning them in a process, so
+        <slug>.openapi-proxy.com answered nothing at all. This is the
+        composition, and bin/apip-fleet and bin/fleet_server are its
+        front doors.
+
+        - The parent polls once, synchronously, before anything binds,
+          because Hyperman builds each listener's SSL_CTX before it
+          forks and the custom-domain certificates come out of that
+          poll. Each worker then arms the poller on its own loop from
+          its first request. A tenant, spec or route is live within one
+          poll; a certificate issued after start is served on the next
+          RESTART, which is why the shipped systemd unit does not wire
+          SIGHUP to `systemctl reload`.
+        - boot_poll returns the status word and never dies: a running
+          fleet survives a failed poll on its last good bundle, a
+          starting one has nothing to fall back to, and only the caller
+          knows which it is. apip-fleet retries and then refuses.
+        - The refusals are at boot, not at the first request: a pool
+          nothing hashes to is named against the pools that exist,
+          `pools` without `pool` is refused, and tls_dir is created 0700
+          before a bundle can unseal a customer's private key into it.
+        - t/32-fleet.t drives a fleet against a control plane on a real
+          socket, so the registry URLs, the Bearer token on a lazy spec
+          fetch and the arming are exercised rather than injected past.
+
+        Plan-tier response sampling, the data-plane half. The control
+        plane has always carried a per-plan sampling rate in the bundle
+        and this end has always ignored it, so every hosted tenant ran
+        adaptive whatever it paid for.
+
+        - Maat::Config->tenant applies the bundle's `sampling` to
+          responses.sample, and clamps it against limits.sampling first -
+          the same shape as the enforce gate beside it, so what a tenant
+          may have is decided from its plan rather than from the value
+          that arrived next to it. Config->load is untouched, so a
+          self-hosted apip.yml still says exactly what it means.
+        - Maat::Sampler: the floor now applies in fixed mode. `sample: N`
+          was a divisor nothing could lower, so 1-in-100 against an
+          operation serving two requests an hour validated one response
+          every fifty hours - a coverage report that reads empty rather
+          than clean. Fixed is a ceiling now, and the floor may lower it.
+          THIS CHANGES BEHAVIOUR for a self-hosted gateway with an
+          explicit `sample: N`: at low traffic it validates more than it
+          used to, which is what `floor` always said it would do.
+        - Maat::Sampler->retune advances its clock in fixed and off mode
+          instead of returning early without touching it. The request
+          path guards the call with next_at and builds the coverage hash
+          to pass in, so a next_at that never moved turned a
+          once-an-interval 0.5us into a per-response one.
+
+0.05    Unreleased
+        Phase 9 of plan_maat, the data-plane half: API keys, per-key rate
+        limits and the abuse ceilings that keep a free tier from becoming
+        an open relay. Every one of these is off by default - with no keys
+        in a tenant's bundle and no security requirement in its document,
+        the gateway forwards exactly as phase 1, byte for byte.
+
+        - API keys, verified in the request path against an in-memory
+          table hung off the tenant. A presented key is sha256'd and
+          constant-time compared against the tenant's stored hashes - the
+          hash rides in the signed bundle, never the secret, and the
+          compare has no early return, so which key matched (or that none
+          did) is not a timing signal. The key table is NOT snapshotted
+          into the compiled app: it rides in on the request from the live
+          tenant meta (Maat::Router sets $env->{'maat.keys'}), so a key
+          the control plane drops stops working on the next poll without
+          the app being rebuilt.
+        - The spec's securityScheme IS the guard. Open::API compiles
+          components.securitySchemes into per-operation requirements;
+          Maat registers its key check as the scheme checker Open::API
+          calls (the new Open::API::check_op_security), rather than
+          inventing a parallel auth path. An operation the document marks
+          apiKey or http-bearer is enforced because the document says so;
+          an operation with no security requirement is untouched. The
+          credential is extracted by Open::API per the scheme's type and
+          location (an apiKey header or query value, a bearer token), so
+          one checker covers every scheme the document declares.
+        - Per-(key, operation) rate limits, a fixed window on
+          Maat::RateLimit. The count is process-shared across the workers
+          of one gateway through an flock'd file, so a 100/min limit holds
+          exact to one request across four workers rather than becoming
+          400/min (t/26). It is NOT distributed across gateways: N
+          gateways behind a balancer admit up to N x the limit, an honest
+          number the POD states plainly rather than a fictional
+          distributed limit. rate_per_min 0 is unlimited and touches
+          nothing. The limiter is anchored in a Legba slot and its counts
+          live in files keyed independently of the compiled spec, so a
+          publish - which rebuilds a tenant's app around a fresh compiled
+          object - does not reset a count (t/25 gate 2). Legba's own slots
+          are copy-on-write across a fork, so Legba is used for what it is,
+          a process-global anchor a registry swap does not touch, while
+          the cross-process arithmetic is the flock'd file.
+        - 429 in the same application/problem+json shape as a validation
+          failure, with Retry-After and X-RateLimit-Limit / -Remaining /
+          -Reset. A denied request carries the request id like every other
+          answer.
+        - Upstream credentials pass through untouched. We are not an
+          identity provider: the header a key was presented in, and any
+          Authorization the client sent, are forwarded to the upstream
+          unchanged (t/25 asserts the upstream received both).
+        - `maat revoke <key-id>` forces a revoked key to stop working at
+          once rather than at the next poll. Revocation happens at the
+          control plane (the key vanishes from the bundle); the data
+          plane's job is to notice immediately. `maat revoke` signals the
+          running gateway (SIGUSR1 by default, --pid / --pidfile) and
+          Maat::Poller's installed handler forces one poll now, picking up
+          the already-updated bundle within a round trip. In-process,
+          Maat::Registry->revoke_key drops the key from the live table
+          directly. Both are proven in t/25 gate 3, alongside the ordinary
+          within-one-poll path.
+        - Maat::RateLimit is new; Maat::Gateway, Maat::Registry,
+          Maat::Router and Maat::Poller gained the wiring above; the C
+          request path (include/mt_serve.h) runs the auth step only when a
+          gateway armed it, so a keyless gateway is unchanged. Requires
+          Open::API 0.09 (check_op_security) and Legba 0.08.
+
+0.04    Unreleased
+        Phases 6 and 7 of plan_maat, the data-plane half: one fleet of
+        workers serves every customer's proxy, routed by hostname,
+        isolated from each other, with a spec publish disturbing nobody.
+
+        - Maat::Registry - the per-worker host -> compiled-tenant map. A
+          compiled spec is DATA (Open::API->new is a runtime
+          constructor), so a worker holds one entry per host and a
+          publish replaces one entry without recycling anything.
+          apply_bundle swaps the whole tenant table in one assignment and
+          drops any entry whose digest moved; an in-flight request holds
+          its own reference to the old compiled object and finishes
+          against it (t/18 proves a held app keeps serving version 1
+          while a fresh resolve gets version 2). Compile is LAZY - on the
+          first request for a host, not at boot - and BOUNDED by an LRU
+          with two caps, a compiled-spec count and a total resident-bytes
+          figure; over either, the least-recently-used entry is evicted
+          and its next request recompiles. Metrics are aggregate counters
+          only (hits, misses, compiles, evictions, bytes_resident,
+          bad_signature, bad_digest, compile_rejected, unknown_host) -
+          nothing keyed by anything unbounded.
+        - The off-path compile budget. A spec pathological to compile is
+          rejected without holding the loop: an input over max_spec_bytes
+          is refused before it is parsed (the ten-megabytes case), and a
+          runaway compile is bounded by a wall-clock deadline in a forked
+          child the parent can kill, since a deferred Perl alarm can never
+          reach a compile spinning in C. The child limits its own address
+          space (BSD::Resource when present) and only ever compiles and
+          _exits, so it never touches the worker's event loop. On breach
+          the host is POISONED - answered 503 until its digest changes -
+          and only that tenant feels it: no neighbour's compiled entry is
+          touched, so no neighbour's latency moves (t/21 kills a 30s
+          compile at its 0.3s budget while a neighbour resolve stays
+          sub-millisecond).
+        - Maat::Poller - config distribution, poll not push, because a
+          poll cannot break in a way that silently stops updating. GETs
+          /registry/bundle with the ETag as If-None-Match, verifies the
+          X-Maat-Bundle-Signature HMAC against the shared registry token
+          BEFORE decoding, and publishes on a fresh 200. A failed poll -
+          a 5xx, a timeout, a torn body, a bad signature - keeps the last
+          good bundle and counts it; the registry never goes blank. The
+          ETag advances only on a clean apply.
+        - Maat::Router - the multi-tenant edge. Routes by Host header
+          (both <slug>.openapi-proxy.com tenants and phase-7 custom
+          domains) to the tenant's compiled app; an unknown host is a 404
+          at the edge that never resolves a tenant or compiles a spec.
+          Per-tenant isolation caps from the plan (body cap -> 413, header
+          cap -> 431, concurrency ceiling -> 429) are checked before the
+          tenant app is entered, and the ceiling slot is held until the
+          response completes - so a tenant whose upstream hangs consumes
+          at most its own ceiling and cannot cut a neighbour's throughput
+          (t/21: a hung tenant pins its 4 slots and 429s the rest while a
+          neighbour serves 100/100). Every response leaves with
+          X-Maat-Version and X-Maat-Proxy, so under a publish each
+          response is attributable to exactly one version (t/22: zero
+          dropped requests through repeated republishes, no torn state).
+          Per-tenant metrics are keyed by proxy id alone.
+        - Phase 7, the edge half: GET /.well-known/acme-challenge/<token>
+          is answered from the bundle's challenge table for any host (the
+          control plane's ACME client runs the protocol; the edge only
+          answers the http-01 probe). An issued domain in the bundle
+          aliases its host to its proxy and its PEM cert/key are
+          materialized to disk - the key mode 0600 - for Hyperman's
+          tls_sni map, which loads certificates from files. A domain that
+          leaves the bundle stops being served and its SNI files are
+          removed within one poll (t/23 drives the whole issue -> serve ->
+          remove cycle through Maat::Poller). Note: Hyperman 0.15 builds
+          the SNI contexts once before forking, so a live cert swap rides
+          its zero-downtime reload; the registry keeps the tls_sni map and
+          the on-disk PEMs current for that reload.
+        - Maat::Shard - the blast-radius function. Free and anonymous
+          tenants never share a pool with paid ones; within a tier the
+          pool is fnv1a_32(lc host) % N, stable across processes and
+          trivially reimplementable at the edge. Maat::Registry filters a
+          pooled worker's bundle to its own tenants through member(), so a
+          bug in one pool cannot reach a tenant in another (t/24). The
+          topology it implies is documented in the module.
+        - The capacity model, measured on this machine and named:
+          bench/capacity.pl and bench/CAPACITY.md. Resident bytes per
+          compiled spec (8.3 KB / 77 KB / 735 KB small/median/large),
+          ~20,900 median tenants per worker in a 1.5 GB budget, a 0.08 ms
+          median miss, ~120,000 req/s per worker at the edge, and a
+          sub-penny-per-million infrastructure cost against a named
+          instance. Starter clears the 80% margin bar with orders of
+          magnitude to spare.
+        - Maat::Config gains a tenant() constructor - an in-memory config
+          from one bundle row, no maat.yml - and Maat::Gateway accepts a
+          pre-compiled api, since in the hosted plane the compile has
+          already happened off the request path. enforce is downgraded to
+          observe for a plan whose limits do not grant it, rather than
+          answering 400 for a gateway the tenant did not pay for.
+
+0.03    Unreleased
+        Phase 4 of plan_maat, the gateway half: mock mode. A gateway
+        with no upstream serves the document itself.
+
+        - mode: mock in maat.yml. The request half is the phase-1 path
+          unchanged - matched, validated, counted, and a non-conforming
+          request answered 400 problem+json with its pointers, exactly
+          as enforce would - which is what makes a mock a client-side
+          conformance check rather than a toy. The response half is
+          Open::API 0.08's synthesize: the media example, a named or the
+          first examples entry, the schema default, or a value generated
+          from the schema, in C, deterministic - the same request gives
+          byte-identical bodies (t/17-mock.t proves 100 in a row, and
+          that the served body validates against the document's own
+          schema).
+        - Prefer: code=404 selects a declared status and Prefer:
+          example=name a named example, so error handling can be
+          exercised from a client without touching the spec.
+        - ?__delay=250ms (also 1.5s, or bare seconds) holds the
+          response, capped at mock.max_delay (10s default): the delay
+          exists to exercise timeouts, and the cap exists so a public
+          mock URL cannot be held open as a DoS lever.
+        - An undeclared path is 404 problem+json naming it undeclared,
+          counted `undeclared` - a mock has nothing to forward the
+          unknown to, and inventing a 200 for a path the document does
+          not declare would defeat the one thing a mock is for.
+        - MAAT_CHAOS gains a `mock` point: a synthesis that dies is
+          answered 500 problem+json and counted `failed`, never a hang.
+          The mock's response path fails closed with an honest error
+          where the proxy's fails open with a forward, because a mock
+          has nothing to fail open to. A dying validator still fails
+          open onto the mock, same rule as the proxy.
+        - `upstream` is refused in mode mock and required otherwise,
+          both said plainly at config load; `maat check` reports the
+          document as the upstream instead of probing one.
+        - Needs Open::API 0.08 for synthesize.
+
+0.03    Unreleased
+        Phase 3 of plan_maat: the violation pipeline. Violations get off
+        the request path immediately, aggregate into something a human
+        can read, and reach the control plane without the gateway ever
+        waiting for it.
+
+        - Violations are AGGREGATED, not emitted one per failure. The
+          pressure this is written against is not correctness, it is
+          volume: one upstream deploy that changes a field's type turns
+          every request into a violation, and a gateway that emitted a
+          record for each would become the outage it was installed to
+          detect. Measured at t/16: 270,000 violations became 8 records,
+          with p99 unmoved (15.0us with reporting off, 18.1us on).
+        - The fingerprint is (spec_version, operation_id, status,
+          pointer, keyword), with array indices collapsed to `*` so an
+          array of 500 bad elements is one record with count 500 rather
+          than 500 records. NO VALUE FROM A PAYLOAD EVER ENTERS A KEY:
+          keys are stored, indexed and displayed by the control plane,
+          and nothing derived from a customer's data may end up there.
+        - A parameter violation is fingerprinted as `query/limit` rather
+          than by an empty pointer. Open::API reports parameter errors
+          with no instanceLocation - there is no document for them to
+          point into - and left as they came, `limit` being too large
+          and `offset` being too large would have been one fingerprint.
+        - Maat::Redact decides what may leave the process, and follows
+          one rule: when in doubt, drop it. A missing example costs
+          somebody a minute; an example that should not have left costs
+          them a disclosure notice. Two independent tests, and a value
+          must pass both - the schema (`writeOnly`, `format: password`)
+          and the field's name (password, token, api_key, cvv and their
+          spellings). The second exists because the first only works
+          when the document is honest, and a document that forgot to
+          mark its password field is exactly the one whose password
+          field must not be shipped. Objects and arrays are never sent
+          whole - they become `{object with 3 keys}` - because a nested
+          object can hold the secret two levels down that the name test
+          never saw. `redact: strict` keeps no example at all.
+        - Maat::Spool: one file per closed window, bounded by count and
+          bytes, written under a temporary name and renamed into place.
+          Past the bound the OLDEST is deleted and counted - during an
+          outage the recent violations are the ones describing what is
+          happening now. A file that cannot be parsed is removed rather
+          than retried forever, which would wedge everything behind it.
+        - Maat::Shipper: batched, gzipped, sent with Fetch, retried with
+          a backoff doubling to a five-minute ceiling. Nothing waits for
+          it: the send is a future whose failure leaves the batch on the
+          spool and moves a counter. Ten minutes of an unreachable
+          control plane under load is a test (t/14), not a hope - the
+          bound holds, the drop count is exact, and everything still
+          held arrives after reconnection.
+        - Fixed before it shipped: the first version of the gzip used
+          Compress::Raw::Zlib with `-WindowBits => WANT_GZIP`, which
+          produces a RAW DEFLATE STREAM WITH NO GZIP HEADER while we
+          labelled it `Content-Encoding: gzip`. Every batch would have
+          been rejected by the control plane, silently. WANT_GZIP is a
+          flag to be added to the window size, not a window size - and
+          `MAX_WBITS + WANT_GZIP` without parentheses parses as
+          `MAX_WBITS(+WANT_GZIP())` and yields 15. It is IO::Compress::
+          Gzip now, and t/14 inflates what the shipper produces rather
+          than trusting its length.
+        - `maat tail --violations`: the live feed on a terminal. This is
+          so the product is useful before the control plane exists - a
+          customer can point Maat at their API, run this in a second
+          window and watch their own drift go past, with no account, no
+          dashboard and no network. It reads the spool and never
+          consumes it: those violations are the shipper's to send.
+        - `report.metrics: /path` serves the gateway's self-report as
+          JSON: the counters, response coverage, spool depth and drops,
+          shipping failures and backoff. Off unless named, because it
+          shadows that path on the proxied API and silently intercepting
+          a path the upstream serves would be the rudest thing a
+          transparent proxy could do.
+        - A window is flushed by the worker's own event loop where there
+          is one (armed once, from the violation path, only when
+          psgix.loop says a loop is live - off a loop Hyperman->timer
+          would block for the whole interval, which on a request path
+          would be the worst bug in this distribution). Elsewhere the
+          violation path does it. Either way the flush is under the same
+          watchdog as the recorder: aggregation moved the sink call from
+          record() to flush(), and the alarm moved with it, or the one
+          thing this component promises - that reporting cannot hold a
+          request - would have quietly stopped being true the moment it
+          started batching.
+        - report: { url, token, window, max_keys, environment, spool,
+          spool_files, spool_bytes, interval, batch, gzip, timeout,
+          redact, redact_names, metrics } in maat.yml. `window: 0`
+          closes a window on every violation, for a low-traffic gateway
+          that wants its drift immediately.
+        - MAAT_CHAOS's `record` and `block` points now exercise the
+          flush as well as the record, since that is where somebody
+          else's code is now called.
+
+0.02    Unreleased
+        - The request path is XS (Maat.xs, include/mt_*.h). One C
+          function, not a set of helpers: the Perl version was not slow
+          line by line - measured, a counter was 0.09us and all three
+          eval blocks together 0.04us - it was slow in shape, a dozen
+          Perl ops and four Perl/XS crossings per request for two calls'
+          worth of work. mt_serve does the request id, every counter,
+          the routing, the validation, the header stamp and every branch
+          between them without unwinding into Perl. The request half
+          went 5.50us to 2.19us (2.5x); with response validation at the
+          shipped default, 7.60us to 3.54us.
+        - The six MAAT_CHAOS injection points moved into C with it, on
+          purpose: a fail-open path exercised only through a Perl
+          wrapper is not the path that runs in production. They fire
+          inside mt_serve at the instants the real failures would.
+          t/05-chaos.t is unchanged and still passes - it is the
+          contract this was written against, not a description of it.
+        - What deliberately stayed Perl: Open::API's router and
+          validator and the proxy (real calls, now call_sv/call_method
+          under G_EVAL so a die still lands in the fail-open branch);
+          the violation recorder and the problem+json builder, which are
+          only reached when a request has actually violated its contract
+          and which own the alarm and the local $SIG{ALRM}; and
+          _forward/_check_response, which own the three response shapes
+          and the sampler.
+        - Validation now goes through Open::API's validate_env (0.07)
+          rather than validate_request: the header hash is built in C,
+          for only the headers the operation declares, instead of
+          walking the whole environment in Perl. That segment was 4.14us
+          and is 0.66us.
+        - Fixed the test client reading until EOF, which made the suite
+          hang intermittently: it made the CLIENT's termination the
+          server's decision, so a server keeping a connection open - as
+          it may, whatever was asked - stopped the run rather than
+          failing it. It now reads the declared Content-Length, with EOF
+          as the fall-back and a read deadline underneath.
+        - t/12-streaming.t records phase 2's second gate as UNMET, with
+          a TODO rather than a lowered threshold: a 128MB body costs the
+          worker 1.0x its size in RSS, where the gate asks for flat.
+          PSGI's streaming writer has no backpressure signal, so nothing
+          here can slow the upstream when the client is slower. The fix
+          is Hyperman exposing its output queue, Fetch pausing a
+          response body and Reverse::Proxy joining them; the design is
+          in plan_maat/phase-2a-backpressure.md. It blocks the phase-6
+          capacity model, not phase 3.
+
+0.02    Unreleased
+        Phase 2 of plan_maat: response validation and sampling. The
+        product's reason to exist - every sampled response weighed
+        against the schema its status declares, and a mismatch recorded
+        WITHOUT ALTERING A SINGLE BYTE THE CLIENT RECEIVES.
+
+        - Response checking on the forward path, at all three shapes a
+          response comes back in: a triplet, a delayed response and a
+          future. It reads the triplet and never writes to it. The gate
+          is asserted byte for byte against the upstream's own answer,
+          header for header, with validation on (t/11-responses.t).
+        - Recorded in enforce as well as observe, and rejected in
+          neither. A response cannot be un-sent, and answering 502
+          because a body drifted from its schema would turn a
+          documentation bug into an outage - the customer's, caused by
+          us. Whether enforcement should ever extend to responses is a
+          product decision, not a side effect of this one.
+        - Maat::Sampler: how much to check, per operation. At most 50
+          validated responses a second for each operation (the cost
+          ceiling), and never longer than 10 seconds without one (so a
+          quiet endpoint is covered rather than merely cheap). The budget
+          is per operation on purpose: one hot endpoint must not spend it
+          all and leave the other ninety uncovered. `sample: all` and
+          `sample: N` are there for a staging environment and for anyone
+          who wants a fixed rate.
+        - $gateway->coverage reports what was actually weighed, per
+          operation: total, sampled, unsampled, checked, violations and
+          each skip_* - with the divisor in force. The counts add up to
+          the total, and that is asserted: coverage that did not add up
+          would be a guess.
+        - `maat explain GET /orders/{id}` (or `maat explain getOrder`)
+          prints the resolved contract - parameters, request bodies, the
+          statuses that carry a schema, and what will happen to a request
+          that fails - from the same compiled spec the gateway serves
+          from, so the tool and the thing it describes cannot disagree.
+        - responses: { validate, sample, budget, floor, interval,
+          max_body } in maat.yml, and `stream: true` to forward bodies
+          chunk by chunk (a streamed body is then counted skip_body and
+          not validated - streaming and response validation are
+          alternatives for one route, not companions).
+        - MAAT_CHAOS gains a `response` point: a check that dies loses
+          the sample and nothing else. The response has already been
+          handed back by the time the check runs, which is why that is
+          the only thing it can lose.
+        - bench/gateway.pl and bench/RESULTS.md: the cost, measured. On
+          one machine, per request over the bare proxy - request
+          validation +0.81us, response validation at 1% +1.01us, at 100%
+          +1.82us. Sampling at the default removes 80% of the cost of
+          response validation.
+        - That number is why two things are shaped as they are. The first
+          working version added 0.39us at 1% instead of 0.20, and the
+          cost was not validation: an options hashref allocated per
+          request, and the whole coverage hash rebuilt per request to
+          hand to a retune that runs once a second. At this scale the
+          cost of asking whether to do the work can exceed the work.
+        - Known, and recorded rather than hidden (t/12-streaming.t): a
+          128MB body grows the worker by ~510MB buffered, ~134MB with
+          `stream: true`. The response check is not holding those bytes -
+          with responses.validate off the growth is identical - it is the
+          forward buffering to the slower of the two sockets, in
+          Reverse::Proxy and Hyperman. Left as a TODO so it un-TODOs when
+          backpressure lands, rather than as a threshold loose enough to
+          pass a real leak.
+        - Needs Open::API 0.07 for check_response, response_coverage and
+          operation_info.
+
+0.01    Unreleased
+        Phase 1 of plan_maat: the proxy core.
+
+        - Maat::Gateway, a PSGI application that matches each request
+          against a compiled OpenAPI document, validates it, and forwards
+          it to the upstream through Reverse::Proxy. Nothing new is fast
+          here and nothing needs to be: Open::API compiles and validates
+          in C, Reverse::Proxy forwards in C through Fetch's ABI, and this
+          distribution is the policy between them - which is why it has no
+          XS of its own.
+        - What the document does not describe is FORWARDED, in both modes,
+          and counted `undeclared`. A specification that does not cover
+          everything is the normal case, and a gateway that rejects what
+          it was not told about cannot be installed in front of a real
+          API. This is the most important default in the product.
+        - observe (the default) records violations and changes nothing.
+          enforce answers a non-conforming request with RFC 7807
+          problem+json carrying the failing JSON pointers, and the
+          upstream never sees it; a declared path with an undeclared
+          method is 405 with an Allow header.
+        - Fail-open is a tested property, not a claim. MAAT_CHAOS is a
+          supported switch that injects the failures the request path is
+          written to survive - freed (the spec handle is gone), match,
+          alloc (buffering the body fails), validate, record, block (the
+          reporter hangs, and a watchdog abandons it) - each with an
+          optional rate. Under any of them the failure is counted and the
+          traffic keeps flowing. Where only the bookkeeping broke, the
+          validation verdict still stands: if a failing reporter
+          downgraded enforcement, anyone who could stall the violation
+          pipeline could switch off request validation.
+        - Bodies are buffered to be validated and put back for the
+          forward, so the upstream receives the same bytes. Over max_body
+          (1MB default) nothing is read at all: the check is skipped and
+          counted, and the body streams through untouched.
+        - X-Request-Id: minted as a UUID v7 when the client did not bring
+          one, forwarded upstream, echoed on the response and carried on
+          every violation record - so a report can be found in the
+          customer's own logs.
+        - Maat::Config: maat.yml, validated at load. Every error names the
+          key path; an unknown key is fatal with a did-you-mean, because a
+          silently ignored option is a setting an operator believes is on.
+          Secret references ({ $env: NAME }, { $file: path }) keep tokens
+          out of files that live in repositories. A TLS listener with only
+          half a certificate is refused rather than quietly serving plain
+          HTTP.
+        - bin/maat: `run` and `check`. check is the pre-deploy gate - it
+          loads the config, compiles the spec exactly as the gateway does
+          and probes the upstream, exiting non-zero with a message that
+          names the fix.
+        - Gate 1 (t/06-byte-identical.t): a corpus of conforming and
+          undeclared requests is sent twice, once straight at the upstream
+          and once through the gateway, and every response must come back
+          identical - status, headers and body - minus the hop-by-hop
+          headers a proxy owns and the X-Request-Id Maat adds. Putting
+          Maat in front of an API may not change the API.

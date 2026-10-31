@@ -1,0 +1,489 @@
+#!/usr/bin/env perl
+use 5.010;
+use strict;
+use warnings;
+use FindBin ();
+use lib "$FindBin::Bin/../lib";
+use Maat::Fleet ();
+use File::Spec ();
+
+# apip-fleet check   - everything that can be wrong before traffic arrives
+# apip-fleet run     - serve every tenant the control plane publishes
+#
+# The hosted data plane. `apip run` is the other program: one document in
+# front of one upstream, which is what a customer runs in their own
+# infrastructure. This one is told what it serves, by the control plane,
+# and holds thousands.
+#
+# Same bargain as `apip check`: `check` is what a deploy pipeline runs,
+# so it has to exit non-zero for anything that would stop the process
+# serving, and it has to say what to do about it. An operator reading
+# this in a pipeline log has no debugger and no context.
+
+$| = 1;
+
+my $command = shift @ARGV;
+unless (defined $command && length $command) {
+    print STDERR usage();
+    exit 1;
+}
+
+my %COMMANDS = (
+    check => \&cmd_check,
+    run   => \&cmd_run,
+    stats => \&cmd_stats,
+    help  => sub { print usage(); 0 },
+);
+
+my $run = $COMMANDS{$command} or do {
+    print STDERR "apip-fleet: unknown command '$command'\n\n", usage();
+    exit 1;
+};
+exit $run->(@ARGV);
+
+# ---- check -------------------------------------------------------------------
+
+sub cmd_check {
+    my ($file) = @_;
+    $file = '/etc/maat/fleet.yml' unless defined $file;
+
+    my $config = eval { Maat::Fleet->load($file) } or return fail($@);
+    print "config    $file\n";
+    print "control   $config->{control_plane}\n";
+    printf "listen    %s\n", join ', ', map {
+        ($_->{host} || '0.0.0.0') . ':' . $_->{port}
+      . ($_->{tls_cert} ? ' https' : ' plain')
+    } @{ $config->{listen} };
+    printf "pool      %s\n", defined $config->{pool}
+        ? "$config->{pool} of " . join(', ',
+              map { "$_ x$config->{pools}{$_}" } sort keys %{ $config->{pools} })
+        : 'every tenant in the bundle (no shard configured)';
+    printf "holds     %d specs, %s\n", $config->{max_specs},
+        _human($config->{max_bytes});
+
+    my $fleet = eval { Maat::Fleet->new(config => $config) } or return fail($@);
+
+    # The poll is the check. Everything above is a file being readable;
+    # this is the credential, the network path, the signature and the
+    # bundle, which is the whole of what a starting worker depends on.
+    my $status = $fleet->boot_poll;
+    my $reg    = $fleet->registry;
+
+    if ($status eq 'applied' || $status eq 'not_modified') {
+        my @hosts   = @{ $reg->hosts   || [] };
+        my @domains = @{ $reg->domains || [] };
+        printf "bundle    %s - %d tenant%s, %d custom domain%s\n",
+            $status, scalar @hosts, (@hosts == 1 ? '' : 's'),
+            scalar @domains, (@domains == 1 ? '' : 's');
+
+        # A fleet that polls a control plane with no tenants is a working
+        # fleet, and also almost always a mistake somebody wants to know
+        # about now rather than after the announcement.
+        print "\nwarning: the bundle is empty. Nothing has a published "
+            . "spec, or this pool's\n         filter matches no tenant.\n"
+            unless @hosts;
+
+        # Say which certificate covers what, because the failure this
+        # catches - a wildcard that is not there - looks like a working
+        # deployment until a customer's client tries to connect.
+        # Which tenants answer /mcp, and how an agent gets in. Both the
+        # toggle and the plan that gates it ride in the bundle, so this
+        # is the same answer the running gateway will give rather than a
+        # second reading of the customer's setting: a proxy switched on
+        # below the plan that carries it is reported off here, which is
+        # what it will be.
+        _report_mcp($reg, \@hosts);
+
+        _report_tls($config, \@hosts, \@domains);
+
+        # A fleet with no visibility is a supported configuration and a
+        # bad one. Check is where costs get named, and this one is paid
+        # later, at the worst moment, by whoever is holding the pager.
+        print "\nnote: no stats_dir, so `apip-fleet stats` has nothing to "
+            . "read and a running\n      fleet can only be inspected from "
+            . "the outside.\n"
+            unless defined $config->{stats_dir} && length $config->{stats_dir};
+        print "\nnote: log is off, so this fleet will not say what it is "
+            . "doing.\n" unless $config->{log};
+
+        print "\nok\n";
+        return 0;
+    }
+
+    return fail(_why($status, $config));
+}
+
+sub _report_mcp {
+    my ($reg, $hosts) = @_;
+    my (@on, @oauth);
+
+    for my $h (@$hosts) {
+        my $t = $reg->tenant($h) or next;
+        my $m = ref $t->{mcp} eq 'HASH' ? $t->{mcp} : undef;
+        next unless $m && $m->{enabled};
+        push @on, $h;
+        push @oauth, $h if $m->{oauth};
+    }
+
+    unless (@on) {
+        printf "mcp       off for %s\n", @$hosts == 1
+            ? 'the one tenant' : "all " . scalar(@$hosts) . " tenants";
+        return;
+    }
+
+    printf "mcp       on for %d of %d tenant%s: %d take OAuth, %d keys only\n",
+        scalar @on, scalar @$hosts, (@$hosts == 1 ? '' : 's'),
+        scalar @oauth, scalar(@on) - scalar(@oauth);
+
+    my @show = @on > 5 ? (@on[0 .. 4], '(' . (@on - 5) . ' more)') : @on;
+    printf "          %s\n", join ', ', @show;
+    return;
+}
+
+sub _report_tls {
+    my ($config, $hosts, $domains) = @_;
+    my ($tls) = grep { $_->{tls_cert} } @{ $config->{listen} };
+    unless ($tls) {
+        print "\nnote: no TLS listener. Every tenant hostname is https in "
+            . "the console and\n      in the docs, so something in front of "
+            . "this process must terminate it.\n";
+        return;
+    }
+    printf "tls       %s\n", $tls->{tls_cert};
+    my @names = eval { _cert_names($tls->{tls_cert}) };
+    return unless @names;
+    printf "covers    %s\n", join ', ', @names;
+
+    my @uncovered = grep { my $h = $_; !grep { _covers($_, $h) } @names }
+                    @$hosts, @$domains;
+    return unless @uncovered;
+    my @show = @uncovered > 5 ? (@uncovered[0 .. 4],
+                                 '(' . (@uncovered - 5) . ' more)')
+                              : @uncovered;
+    print "\nwarning: this certificate does not cover "
+        . scalar(@uncovered) . " served host"
+        . (@uncovered == 1 ? '' : 's') . ":\n";
+    print "           $_\n" for @show;
+    print "         A tenant zone needs a wildcard, which needs DNS-01.\n";
+}
+
+# The names a PEM actually covers - SANs, falling back to the subject CN.
+# Shelling out to openssl rather than parsing DER here: it is on the box
+# already (the ACME machinery needs it) and this runs once, in `check`.
+sub _cert_names {
+    my ($path) = @_;
+    my $text = `openssl x509 -in "$path" -noout -text 2>/dev/null` or return ();
+    my @names;
+    if ($text =~ /Subject Alternative Name:\s*\n\s*(.+)/) {
+        push @names, map { s/^DNS://r } grep { /^DNS:/ }
+                     map { s/^\s+|\s+$//gr } split /,/, $1;
+    }
+    push @names, $1 if !@names && $text =~ /Subject:.*?CN\s*=\s*([^\s,\/]+)/;
+    return @names;
+}
+
+sub _covers {
+    my ($name, $host) = @_;
+    return 1 if lc $name eq lc $host;
+    return 0 unless $name =~ /\A\*\.(.+)\z/;
+    my $suffix = lc $1;
+    my $h = lc $host;
+    return 0 unless length($h) > length($suffix) + 1;
+    return 0 unless substr($h, -length($suffix) - 1) eq ".$suffix";
+    # one label, the way a wildcard actually matches
+    return index(substr($h, 0, length($h) - length($suffix) - 1), '.') < 0;
+}
+
+# What each failed status means for the person reading it, and what to do.
+sub _why {
+    my ($status, $config) = @_;
+    my $url = "$config->{control_plane}/registry/bundle";
+    return <<"WHY" if $status eq 'bad_signature';
+the bundle did not verify.
+
+  Its HMAC did not match the token in this file. The control plane signs
+  with MAAT_REGISTRY_TOKEN and this process verifies with
+  `registry_token`; they are one shared secret and they disagree.
+
+    $url
+WHY
+    return <<"WHY" if $status eq 'bad_body';
+the bundle was not JSON.
+
+  A signed body that will not decode usually means something in the path
+  rewrote it - a proxy, a compression layer, an error page from a load
+  balancer that answered instead of the control plane.
+
+    $url
+WHY
+    return <<"WHY";
+could not fetch the bundle.
+
+  Nothing was applied, so a worker starting now would serve 404 for
+  every tenant. In order of likelihood:
+
+    * MAAT_REGISTRY_TOKEN is not set on the control plane - the endpoint
+      answers 503 "registry not configured" without it;
+    * `registry_token` here is not that token (401);
+    * this box cannot reach the control plane at all.
+
+  Check it by hand, with whatever `registry_token` resolves to (401 is
+  the wrong token, 503 is a control plane with none, and anything else
+  is the network):
+
+    curl -sS -o /dev/null -w '%{http_code}\\n' \\
+      -H "Authorization: Bearer \$TOKEN" \\
+      $url
+WHY
+}
+
+# ---- run ---------------------------------------------------------------------
+
+sub cmd_run {
+    my ($file) = @_;
+    $file = '/etc/maat/fleet.yml' unless defined $file;
+
+    my $config = eval { Maat::Fleet->load($file) } or return fail($@);
+
+    # The event log, on before anything else happens, so the boot poll's
+    # own result is in it. `check` deliberately does not do this: its
+    # output is a report for a person, and interleaving JSON through it
+    # would spoil both.
+    if ($config->{log}) {
+        require Maat::Log;
+        Maat::Log->enable(1);
+    }
+
+    my $fleet  = eval { Maat::Fleet->new(config => $config) } or return fail($@);
+
+    # Come up with tenants or do not come up. A worker that starts empty
+    # and fills in fifteen seconds answers 404 for fifteen seconds, to
+    # real traffic, on hostnames customers have published - and it does
+    # it looking healthy. A running fleet survives a failed poll on its
+    # last good bundle; a starting one has nothing to fall back to, so
+    # the same failure is fatal here and survivable there.
+    #
+    # Retried first, though, because "the control plane is not up yet" is
+    # not the same failure as "the control plane will not have us". A box
+    # holding both planes starts them seconds apart, and a whole fleet
+    # refusing to exist because it was two seconds early would be a
+    # startup order problem dressed as a credentials problem. A wrong
+    # token fails the same way on every attempt and still ends here, just
+    # later.
+    my $tries = $ENV{APIP_FLEET_BOOT_TRIES} || 5;
+    my $status;
+    for my $try (1 .. $tries) {
+        $status = $fleet->boot_poll;
+        last if $status eq 'applied' || $status eq 'not_modified';
+        last if $try == $tries;
+        warn "apip-fleet: bundle poll $try/$tries said '$status'; "
+           . "retrying in 2s\n";
+        sleep 2;
+    }
+    return fail(_why($status, $config))
+        unless $status eq 'applied' || $status eq 'not_modified';
+
+    # One file before the first request, so a worker that never serves
+    # anything still appears in `apip-fleet stats` - a missing worker and
+    # an idle one look identical otherwise, and the difference matters.
+    $fleet->write_stats(1);
+
+    my $hosts = scalar @{ $fleet->registry->hosts || [] };
+    printf "apip-fleet: %d tenant%s, serving %s\n", $hosts,
+        ($hosts == 1 ? '' : 's'),
+        join(', ', map { ($_->{host} || '0.0.0.0') . ':' . $_->{port} }
+                   @{ $config->{listen} });
+
+    $fleet->run;
+    return 0;
+}
+
+# ---- stats -------------------------------------------------------------------
+#
+# What each worker holds, read off disk rather than asked over HTTP.
+#
+# Two reasons it is a file. This fleet serves arbitrary customer
+# hostnames, so a metrics PATH would shadow some tenant's real route and
+# a metrics LISTENER is one more thing to authenticate; and a file is
+# still readable when a worker is too busy to answer anything, which is
+# the state most worth inspecting.
+#
+# Per worker, never summed away. Each worker keeps its own registry and
+# polls on its own timer, so they can disagree - and when they do, that
+# disagreement is the bug. A fleet-wide total would hide exactly the
+# thing worth seeing.
+
+sub cmd_stats {
+    my (@argv) = @_;
+    my $json = _want_json(\@argv);
+    my $file = $argv[0] // '/etc/maat/fleet.yml';
+
+    my $config = eval { Maat::Fleet->load($file) } or return fail($@);
+    my $dir = $config->{stats_dir};
+    unless (defined $dir && length $dir) {
+        print STDERR <<'WHY';
+apip-fleet: this fleet has no stats_dir, so its workers report nothing.
+
+  Counters are written per worker to files under it, and this command
+  reads them. Without it a running fleet can only be inspected from the
+  outside, which is how an afternoon disappears.
+
+    stats_dir: /var/lib/maat/stats
+
+WHY
+        return 1;
+    }
+
+    opendir my $dh, $dir or do {
+        print STDERR "apip-fleet: cannot read $dir: $!\n";
+        return 1;
+    };
+    my @files = sort grep { /\Aworker-\d+\.json\z/ } readdir $dh;
+    closedir $dh;
+
+    unless (@files) {
+        print STDERR "apip-fleet: no worker has reported into $dir yet.\n"
+                   . "  A worker writes its first file as it starts and then "
+                   . "once an interval.\n";
+        return 1;
+    }
+
+    require File::Raw::JSON;
+    my $now   = time;
+    # Three intervals: one missed write is a slow moment, three is a
+    # worker that has stopped reporting and whose numbers must not be
+    # added to a total as though they were current.
+    my $stale = 3 * ($config->{interval} || 15);
+
+    my (@rows, %total);
+    for my $f (@files) {
+        my $path = File::Spec->catfile($dir, $f);
+        open my $fh, '<', $path or next;
+        local $/;
+        my $s = eval { File::Raw::JSON::file_json_decode(scalar <$fh>) };
+        close $fh;
+        next unless ref $s eq 'HASH';
+
+        my $age = $now - ($s->{t} || 0);
+        $s->{age}   = $age;
+        $s->{stale} = $age > $stale ? 1 : 0;
+        push @rows, $s;
+        next if $s->{stale};
+        for my $k (qw(tenants specs_resident poisoned)) {
+            $total{$k} += $s->{registry}{$k} || 0;
+        }
+        for my $k (qw(compiles compile_rejected unknown_host misses)) {
+            $total{$k} += $s->{registry}{$k} || 0;
+        }
+    }
+
+    if ($json) {
+        print File::Raw::JSON::file_json_encode(
+            { workers => \@rows, live_total => \%total }, sort_keys => 1), "\n";
+        return 0;
+    }
+
+    printf "%-8s %5s %7s %7s %8s %8s %8s  %s\n",
+        'worker', 'age', 'tenants', 'specs', 'compiles', 'rejects',
+        'poisoned', 'polls';
+    for my $s (sort { $a->{worker} <=> $b->{worker} } @rows) {
+        my $r = $s->{registry} || {};
+        printf "%-8s %4ds %7s %7s %8s %8s %8s  ok=%s fail=%s%s\n",
+            $s->{worker}, $s->{age},
+            $r->{tenants} // '-', $r->{specs_resident} // '-',
+            $r->{compiles} // 0, $r->{compile_rejected} // 0,
+            $r->{poisoned} // 0,
+            $r->{poll_ok} // 0, $r->{poll_fail} // 0,
+            ($s->{stale} ? '  STALE - not counted' : '');
+    }
+
+    # The line that would have answered the 404s in one look: workers
+    # holding different tenant tables have diverged, which is what a
+    # worker that has never polled looks like from outside.
+    my %seen = map { ($_->{registry}{tenants} // '-') => 1 }
+               grep { !$_->{stale} } @rows;
+    print "\nwarning: workers disagree about how many tenants they hold ("
+        . join(', ', sort keys %seen) . ").\n"
+        . "         A worker that has never polled is still serving the "
+        . "boot-time table.\n"
+            if keys %seen > 1;
+
+    my @poisoned = map { @{ $_->{poisoned_hosts} || [] } }
+                   grep { !$_->{stale} } @rows;
+    if (@poisoned) {
+        my %u; $u{$_}++ for @poisoned;
+        print "\npoisoned (answered 503 until the digest moves):\n";
+        print "  $_\n" for sort keys %u;
+    }
+    return 0;
+}
+
+sub _want_json {
+    my ($argv) = @_;
+    my $want = 0;
+    @$argv = grep { $_ eq '--json' ? (($want = 1), 0) : 1 } @$argv;
+    return $want;
+}
+
+# ---- ------------------------------------------------------------------------
+
+sub fail {
+    my ($msg) = @_;
+    $msg = 'failed' unless defined $msg && length $msg;
+    $msg =~ s/ at \S+ line \d+\.?\n?\z//;
+    $msg =~ s/\s+\z//;
+    print STDERR "apip-fleet: $msg\n";
+    return 1;
+}
+
+sub _human {
+    my ($n) = @_;
+    return sprintf '%.0fG', $n / 1024**3 if $n >= 1024**3;
+    return sprintf '%.0fM', $n / 1024**2 if $n >= 1024**2;
+    return sprintf '%.0fk', $n / 1024    if $n >= 1024;
+    return "$n bytes";
+}
+
+sub usage {
+    return <<'USAGE';
+usage: apip-fleet COMMAND [fleet.yml]
+
+  check    resolve the configuration, fetch and verify one bundle, and
+           report what would be served - including whether the TLS
+           certificate covers the hostnames in it. Exits non-zero for
+           anything that would stop the process serving.
+  run      serve every tenant the control plane publishes
+  stats    what each worker holds, read from stats_dir - tenants, specs,
+           compiles, poisoned hosts, poll counts. Per worker and never
+           summed: workers keep their own registries and poll on their
+           own timers, and when they disagree that IS the finding.
+           [--json]
+  help     this text
+
+The file defaults to /etc/maat/fleet.yml.
+
+  fleet.yml:
+
+    control_plane:  https://openapi-proxy.com
+    registry_token: { $env: APIP_REGISTRY_TOKEN }
+
+    listen:
+      - { port: 80 }                       # ACME http-01 lives here
+      - { port: 443, tls_cert: /etc/letsencrypt/live/apip/fullchain.pem,
+                     tls_key:  /etc/letsencrypt/live/apip/privkey.pem }
+
+    workers:     4
+    max_specs:   1000
+    max_bytes:   256M
+    tls_dir:     /var/lib/maat/tls
+    report_url:  https://openapi-proxy.com/ingest/violations
+    environment: production
+
+Port 80 serves the router rather than redirecting: a custom domain is
+validated over plain HTTP before its certificate exists, and Hyperman's
+redirect_https answers every request in C before the application is
+reached - including the challenge.
+
+See Maat::Fleet for every key.
+USAGE
+}

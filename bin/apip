@@ -1,0 +1,1095 @@
+#!/usr/bin/env perl
+use 5.010;
+use strict;
+use warnings;
+use FindBin ();
+use lib "$FindBin::Bin/../lib";
+use IO::Socket::INET ();
+use Open::API ();
+use Maat::Config ();
+use Maat::Gateway ();
+
+# apip check   - everything that can be wrong before traffic arrives
+# apip run     - serve
+#
+# `check` exists to be run in CI, before a deploy. It has to exit
+# non-zero for anything that would stop the gateway serving, and it has
+# to say what to do about it: an operator reading this in a pipeline log
+# has no debugger and no context.
+
+$| = 1;
+
+my $command = shift @ARGV;
+unless (defined $command && length $command) {
+    print STDERR usage();
+    exit 1;
+}
+
+my %COMMANDS = (
+    run     => \&cmd_run,
+    check   => \&cmd_check,
+    explain => \&cmd_explain,
+    tail    => \&cmd_tail,
+    revoke  => \&cmd_revoke,
+    help    => sub { print usage(); 0 },
+
+    # The control plane's management API, from a terminal. The house
+    # rule: a write action that exists only in a browser is one you
+    # cannot perform at 3am, so everything the console does is here -
+    # and t/27-cli-parity.t fails the build if the API grows an
+    # operation none of these reaches.
+    proxies    => \&cmd_proxies,
+    specs      => \&cmd_specs,
+    env        => \&cmd_env,
+    violations => \&cmd_violations,
+    coverage   => \&cmd_coverage,
+    alert      => \&cmd_alert,
+    examples   => \&cmd_examples,
+    mcp        => \&cmd_mcp,
+    operations => \&cmd_operations,
+);
+
+my $run = $COMMANDS{$command} or do {
+    print STDERR "apip: unknown command '$command'\n\n", usage();
+    exit 1;
+};
+exit $run->(@ARGV);
+
+# ---- check -------------------------------------------------------------------
+
+sub cmd_check {
+    my ($file) = @_;
+    $file = 'apip.yml' unless defined $file;
+    my $bad = 0;
+
+    my $config = eval { Maat::Config->load($file) };
+    if (!$config) {
+        my $why = _why($@);
+        print STDERR "apip check: $why\n";
+        print STDERR "  Fix that key in $file and run check again.\n"
+            if $why =~ /unknown key/;
+        return 1;
+    }
+    printf "  config    %s\n", $file;
+
+    # The spec, compiled exactly as the gateway compiles it. This is what
+    # makes `apip check` a pre-deploy gate rather than a syntax test.
+    my $api = eval { Open::API->new(spec => $config->spec) };
+    if (!$api) {
+        printf "  spec      %s DID NOT COMPILE\n", $config->spec;
+        print STDERR "apip check: the spec " . $config->spec
+                   . " did not compile:\n    " . _why($@) . "\n"
+                   . "  maat will refuse to start until it does.\n";
+        $bad = 1;
+    }
+    else {
+        my $ops = $api->operations;
+        printf "  spec      %s compiles; %d operation%s\n",
+               $config->spec, scalar @$ops, @$ops == 1 ? '' : 's';
+    }
+
+    # The upstream. Not fatal to the gateway - it starts anyway and
+    # forwards as soon as the upstream is back, because refusing to boot
+    # would turn their brief outage into a longer one - but `check` is a
+    # pre-deploy gate, and a gateway pointed at nothing is not ready.
+    # A mock has no upstream at all: the document is the upstream.
+    if ($config->mode eq 'mock') {
+        printf "  upstream  none (mode: mock serves the document)\n";
+    }
+    else {
+        my ($host, $port) = _hostport($config->upstream);
+        my $sock = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port,
+                                         Proto => 'tcp', Timeout => 5);
+        if ($sock) {
+            close $sock;
+            printf "  upstream  %s:%s answers\n", $host, $port;
+        }
+        else {
+            printf "  upstream  %s:%s NO ANSWER\n", $host, $port;
+            print STDERR "apip check: nothing is answering at $host:$port.\n"
+                       . "  Start the upstream, or correct `upstream` in $file.\n"
+                       . "  (apip run would still start and would forward as soon "
+                       . "as it answers.)\n";
+            $bad = 1;
+        }
+    }
+
+    for my $l (@{ $config->listen }) {
+        printf "  listen    %s:%s%s%s\n", $l->{host}, $l->{port},
+               ($l->{tls_cert} ? ' (tls)' : ''),
+               (defined $l->{redirect_https}
+                    ? " -> 301 to https on $l->{redirect_https}" : '');
+    }
+    printf "  mode      %s\n", $config->mode;
+
+    print $bad ? "\nmaat check: NOT ready\n"
+               : "\n  `apip run $file` will start.\n";
+    return $bad;
+}
+
+# ---- tail --------------------------------------------------------------------
+
+# The live feed, on a terminal. This exists so the product is useful
+# before the control plane does: a customer can point Maat at their API,
+# run this in a second window, and watch their own contract drift go past
+# in real time. That is the whole demo, and it needs no account, no
+# dashboard and no network.
+#
+# It reads the spool, because the spool is where a closed window goes and
+# it is already bounded, ordered and on disk. `--violations` is accepted
+# and ignored: it is what the plan calls this, and there is nothing else
+# to tail yet.
+
+sub cmd_tail {
+    my @argv = @_;
+    my ($file, $follow, $json) = ('apip.yml', 1, 0);
+    my @rest;
+    for my $a (@argv) {
+        if    ($a eq '--violations') { }            # the only feed there is
+        elsif ($a eq '--json')       { $json = 1 }
+        elsif ($a eq '--once')       { $follow = 0 }
+        elsif ($a =~ /\A--/)         {
+            print STDERR "apip tail: unknown option '$a'\n";
+            return 2;
+        }
+        else { push @rest, $a }
+    }
+    $file = $rest[0] if @rest;
+
+    my $config = eval { Maat::Config->load($file) };
+    if (!$config) {
+        print STDERR "apip tail: " . _why($@) . "\n";
+        return 1;
+    }
+
+    my $dir = $config->report->{spool};
+    unless (defined $dir && length $dir) {
+        print STDERR <<"WHY";
+apip tail: there is no spool to read.
+
+  Violations are aggregated in the gateway process and written to a
+  spool directory; this reads that. Give one in $file:
+
+      report:
+        spool: /var/spool/maat
+
+  and restart the gateway.
+WHY
+        return 1;
+    }
+
+    require Maat::Spool;
+    my $spool = eval { Maat::Spool->new(dir => $dir) };
+    if (!$spool) {
+        print STDERR "apip tail: cannot read the spool at $dir: " . _why($@) . "\n";
+        return 1;
+    }
+
+    # Reading is not consuming: `apip tail` must never take a violation
+    # the shipper has not sent yet. So it remembers what it has printed
+    # and leaves every file where it found it.
+    my %seen;
+    my $printed = 0;
+    print STDERR "  tailing $dir - Ctrl-C to stop\n\n" if $follow && -t STDOUT;
+
+    while (1) {
+        for my $batch ($spool->take(1000)) {
+            my ($name, $records) = @$batch;
+            next if $seen{$name}++;
+            for my $r (@$records) {
+                print $json ? _tail_json($r) : _tail_line($r);
+                $printed++;
+            }
+        }
+        last unless $follow;
+        select undef, undef, undef, 0.5;
+    }
+    return $printed ? 0 : 0;
+}
+
+sub _tail_json {
+    my ($r) = @_;
+    require File::Raw::JSON;
+    return File::Raw::JSON::file_json_encode($r) . "\n";
+}
+
+# One violation, one line, in the order somebody reads it: when, how
+# many, which operation, where and what. The count leads because "this
+# happened 40,000 times" is a different problem from "this happened
+# once", and that is the first thing to know.
+sub _tail_line {
+    my ($r) = @_;
+    my @t = localtime($r->{last_seen} || time);
+    my $when = sprintf '%02d:%02d:%02d', $t[2], $t[1], $t[0];
+    my $what = join ' ',
+        (defined $r->{kind} && $r->{kind} eq 'response' ? 'response' : 'request'),
+        (defined $r->{status} ? "$r->{status}" : ());
+    my $line = sprintf "%s  x%-6s %-20s %-6s %-24s %s",
+        $when,
+        $r->{count} || 1,
+        (defined $r->{operation_id} ? $r->{operation_id} : '-'),
+        $what,
+        (defined $r->{pointer} && length $r->{pointer} ? $r->{pointer} : '-'),
+        (defined $r->{keyword} ? $r->{keyword} : '-');
+    $line .= sprintf ' (expected %s, got %s)', $r->{expected}, $r->{got_type}
+        if defined $r->{expected} && defined $r->{got_type};
+    $line .= sprintf ' example=%s', $r->{example} if defined $r->{example};
+    return "$line\n";
+}
+
+# ---- revoke ------------------------------------------------------------------
+
+# `apip revoke <key-id>` makes a revoked key stop working AT ONCE rather
+# than waiting out the poll interval.
+#
+# Revocation itself happens at the control plane: openapi-proxy.com drops
+# the key from the signed bundle, and every gateway stops honouring it on
+# its next poll (the key's hash simply vanishes from the in-memory table).
+# This forces that poll NOW. It signals the running gateway - SIGUSR1 by
+# default - and Maat::Poller's installed handler runs one poll_once, which
+# pulls the already-updated bundle within a round trip. So the key is dead
+# within a request rather than within an interval.
+#
+# The gateway's pid comes from --pid or --pidfile. Nothing here talks to
+# the control plane: the revoke has already happened there, and this only
+# hurries the data plane along.
+sub cmd_revoke {
+    my @argv = @_;
+    my ($pid, $pidfile, $signal) = (undef, undef, 'USR1');
+    my @rest;
+    while (@argv) {
+        my $a = shift @argv;
+        if    ($a eq '--pid')     { $pid = shift @argv }
+        elsif ($a eq '--pidfile') { $pidfile = shift @argv }
+        elsif ($a eq '--signal')  { $signal = shift @argv }
+        elsif ($a =~ /\A--/) {
+            print STDERR "apip revoke: unknown option '$a'\n";
+            return 2;
+        }
+        else { push @rest, $a }
+    }
+    my $key_id = $rest[0];
+    unless (defined $key_id && length $key_id) {
+        print STDERR
+            "usage: apip revoke <key-id> [--pid N | --pidfile PATH] [--signal NAME]\n";
+        return 2;
+    }
+
+    if (!defined $pid && defined $pidfile) {
+        open my $fh, '<', $pidfile or do {
+            print STDERR "apip revoke: cannot read pidfile '$pidfile': $!\n";
+            return 1;
+        };
+        $pid = <$fh>;
+        close $fh;
+        $pid =~ s/\s+//g if defined $pid;
+    }
+    unless (defined $pid && $pid =~ /\A\d+\z/) {
+        print STDERR <<"WHY";
+apip revoke: no gateway pid to signal.
+
+  The key is revoked at the control plane - openapi-proxy.com drops it
+  from the signed bundle - and every gateway stops honouring it on its
+  next poll. This forces that poll NOW so the key stops working at once
+  instead of within the poll interval. Point it at the running gateway:
+
+      apip revoke $key_id --pid 12345
+      apip revoke $key_id --pidfile /run/maat.pid
+WHY
+        return 1;
+    }
+
+    my $sig = $signal;
+    $sig =~ s/\ASIG//;
+    if (kill $sig, $pid) {
+        print "  signalled gateway $pid (SIG$sig) to re-poll now; key $key_id "
+            . "stops working\n  within one round trip.\n";
+        return 0;
+    }
+    print STDERR "apip revoke: could not signal pid $pid: $!\n";
+    return 1;
+}
+
+# ---- explain -----------------------------------------------------------------
+
+# What Maat will actually check for one operation, before anyone turns it
+# on in front of real traffic. The question this answers is "what happens
+# to my requests if I do this", and the answer has to come from the same
+# compiled spec the gateway serves from - not from reading the document
+# again in a different way, which is how a tool ends up disagreeing with
+# the thing it describes.
+
+sub cmd_explain {
+    my @argv = @_;
+    my $file = 'apip.yml';
+    if (@argv && $argv[0] =~ /\.ya?ml\z/) { $file = shift @argv }
+
+    my ($method, $path) = @argv;
+    unless (defined $method && length $method) {
+        print STDERR "usage: apip explain [apip.yml] METHOD /path\n"
+                   . "       apip explain [apip.yml] operationId\n";
+        return 2;
+    }
+
+    my $config = eval { Maat::Config->load($file) };
+    if (!$config) {
+        print STDERR "apip explain: " . _why($@) . "\n";
+        return 1;
+    }
+    my $api = eval { Open::API->new(spec => $config->spec) };
+    if (!$api) {
+        print STDERR "apip explain: the spec " . $config->spec
+                   . " did not compile:\n    " . _why($@) . "\n";
+        return 1;
+    }
+
+    # Either spelling: `explain GET /orders/{id}`, or the operationId.
+    my $op_id;
+    if (defined $path && length $path) {
+        ($op_id) = $api->match(uc $method, $path);
+        unless (defined $op_id) {
+            print STDERR "apip explain: nothing in " . $config->spec
+                       . " matches @{[ uc $method ]} $path.\n"
+                       . "  Maat forwards that path without checking it, and "
+                       . "counts it `undeclared`.\n";
+            return 1;
+        }
+    }
+    else {
+        $op_id = $method;
+        my $ops = $api->operations;
+        unless (grep { $_->{operationId} eq $op_id } @$ops) {
+            print STDERR "apip explain: no operation '$op_id' in "
+                       . $config->spec . ".\n";
+            return 1;
+        }
+    }
+
+    my $info = $api->operation_info($op_id);
+    my $r    = $config->responses;
+
+    printf "\n  %s %s\n", uc $info->{method}, $info->{path};
+    printf "  operationId  %s\n", $info->{operationId};
+    printf "  security     %s\n",
+        $info->{secured} ? 'required by the document' : 'none declared';
+
+    print "\n  request\n";
+    if (@{ $info->{parameters} }) {
+        for my $p (sort { $a->{in} cmp $b->{in} || $a->{name} cmp $b->{name} }
+                        @{ $info->{parameters} }) {
+            printf "    %-8s %-24s %s%s\n", $p->{in}, $p->{name},
+                   $p->{required} ? 'required' : 'optional',
+                   $p->{schema} ? '' : '  (no schema: presence only)';
+        }
+    }
+    else {
+        print "    no parameters declared\n";
+    }
+    if (@{ $info->{body} }) {
+        for my $b (@{ $info->{body} }) {
+            printf "    body     %-24s %s%s\n", $b->{content_type},
+                   $info->{body_required} ? 'required' : 'optional',
+                   $b->{validated} ? '' : '  (not JSON: forwarded unchecked)';
+        }
+    }
+    else {
+        print "    no request body declared\n";
+    }
+
+    print "\n  response\n";
+    if (@{ $info->{responses} }) {
+        for my $s (sort { $a->{status} cmp $b->{status} }
+                        @{ $info->{responses} }) {
+            printf "    %-8s %-24s %s\n", $s->{status}, $s->{content_type},
+                   $s->{validated} ? 'checked against its schema'
+                                   : 'no schema: not checked';
+        }
+    }
+    else {
+        print "    no response schema declared - nothing to check against.\n"
+            . "    Responses are forwarded and counted `skip_schema`.\n";
+    }
+
+    print "\n  what maat will do\n";
+    printf "    mode         %s%s\n", $config->mode,
+        $config->enforcing
+            ? ' - a non-conforming request is answered here, not forwarded'
+            : ' - nothing is rejected; violations are recorded';
+    if (!$r->{validate}) {
+        print "    responses    not checked (responses.validate is off)\n";
+    }
+    elsif ($r->{sample} eq 'adaptive') {
+        printf "    responses    checked, adaptively: at most %g a second "
+             . "for this\n                 operation, and at least one every "
+             . "%g seconds\n", $r->{budget}, $r->{floor};
+    }
+    elsif ($r->{sample} eq 'all') {
+        print "    responses    every one is checked\n";
+    }
+    else {
+        printf "    responses    one in %d is checked\n", $r->{sample};
+    }
+    printf "    body cap     requests over %s are forwarded unchecked; "
+         . "responses over %s\n", _size($config->{max_body}),
+           _size($r->{max_body});
+    print  "    a response is never altered, whatever it says.\n\n";
+
+    return 0;
+}
+
+sub _size {
+    my ($n) = @_;
+    return "$n bytes" if $n < 1024;
+    return sprintf('%gk', $n / 1024) if $n < 1024 * 1024;
+    return sprintf('%gM', $n / 1024 / 1024);
+}
+
+# Croak text as an operator should read it: no file and line from inside
+# our own modules, which tell them nothing they can act on.
+sub _why {
+    my ($e) = @_;
+    $e = '' unless defined $e;
+    $e =~ s/ at \S+ line \d+\.?\n?\z//;
+    $e =~ s/\s+\z//;
+    return $e;
+}
+
+# ---- run ---------------------------------------------------------------------
+
+sub cmd_run {
+    my ($file) = @_;
+    $file = 'apip.yml' unless defined $file;
+
+    my $config = eval { Maat::Config->load($file) };
+    if (!$config) {
+        print STDERR "apip: " . _why($@) . "\n";
+        return 1;
+    }
+
+    my $gateway = eval { Maat::Gateway->new(config => $config) };
+    if (!$gateway) {
+        print STDERR "apip: " . _why($@) . "\n";
+        return 1;
+    }
+    my $app = $gateway->to_app;
+
+    my @listen = map {
+        my %l = %$_;
+        delete $l{$_} for grep { !defined $l{$_} } keys %l;
+        \%l;
+    } @{ $config->listen };
+
+    eval { require Hyperman; 1 } or do {
+        print STDERR <<"WHY";
+apip: Hyperman is not installed.
+
+  The gateway is an ordinary PSGI application, so any server will serve
+  it - but `apip run` hosts it on Hyperman for the event loop (one
+  worker proxies many concurrent requests) and for TLS. Either install
+  it, or run the app yourself:
+
+      plackup -s Starman -p 8080 -e 'do "$file"'
+
+WHY
+        return 1;
+    };
+
+    _banner($config, $gateway, \@listen);
+
+    Hyperman->run(
+        app     => $app,
+        listen  => \@listen,
+        workers => $config->workers,
+        ($config->{access_log} ? (access_log => $config->{access_log}) : ()),
+    );
+    return 0;
+}
+
+sub _banner {
+    my ($config, $gateway, $listen) = @_;
+    my $ops = eval { $gateway->api->operations } || [];
+    my $where = join ', ', map { "$_->{host}:$_->{port}" } @$listen;
+    print <<"UP";
+
+  Maat is up.
+
+    listening  $where
+    upstream   @{[ $config->upstream ]}
+    spec       @{[ $config->spec ]} (@{[ scalar @$ops ]} operations)
+    mode       @{[ $config->mode ]}@{[ $config->enforcing
+        ? " - non-conforming requests are answered here, not forwarded"
+        : " - nothing is rejected; violations are recorded" ]}
+@{[ $ENV{APIP_CHAOS} ? "    chaos      $ENV{APIP_CHAOS} - INJECTING FAILURES ON PURPOSE\n" : '' ]}
+  Ctrl-C to stop.
+
+UP
+    return;
+}
+
+sub _hostport {
+    my ($url) = @_;
+    my ($scheme, $host, $port) = $url =~ m{\A(https?)://([^:/]+)(?::(\d+))?};
+    $port = $scheme eq 'https' ? 443 : 80 unless defined $port;
+    return ($host, $port);
+}
+
+# ---- the control plane, from a terminal --------------------------------------
+#
+# Everything below talks to the management API through Maat::Remote. The
+# control plane validates every request against its own OpenAPI document,
+# so these commands do not re-check what the contract already checks -
+# they turn arguments into a request and a response into something you
+# can read in a pipeline log at 3am.
+#
+# Output is a table by default and JSON with --json, because half of
+# these will be read by a person and half by a script, and guessing
+# wrong is worse than a flag.
+
+sub _remote {
+    require Maat::Remote;
+    my $api = eval { Maat::Remote->new };
+    unless ($api) {
+        print STDERR "apip: $@";
+        return;
+    }
+    return $api;
+}
+
+# --json anywhere in the arguments, removed before positional parsing.
+sub _want_json {
+    my ($argv) = @_;
+    my $want = 0;
+    @$argv = grep { $_ eq '--json' ? (($want = 1), 0) : 1 } @$argv;
+    return $want;
+}
+
+# --name value pairs, removed the same way. Unknown flags are left in
+# place so a command can complain about them by name.
+sub _opts {
+    my ($argv, @known) = @_;
+    my %known = map { $_ => 1 } @known;
+    my (%opt, @rest);
+    while (@$argv) {
+        my $a = shift @$argv;
+        if ($a =~ /^--([\w-]+)$/ && $known{$1}) {
+            $opt{$1} = @$argv && $argv->[0] !~ /^--/ ? shift @$argv : 1;
+            next;
+        }
+        push @rest, $a;
+    }
+    @$argv = @rest;
+    return \%opt;
+}
+
+# The answer, printed. A non-2xx is reported with whatever the control
+# plane said about it, because it took the trouble to say something.
+sub _out {
+    my ($status, $body, %o) = @_;
+    if ($status < 200 || $status >= 300) {
+        my $why = ref $body eq 'HASH'
+            ? ($body->{detail} || $body->{title}
+               || (ref $body->{errors} eq 'ARRAY'
+                     ? join('; ', map { $_->{message} // '' } @{ $body->{errors} })
+                     : ''))
+            : (defined $body && !ref $body ? $body : '');
+        $why = "the control plane answered $status" unless length($why // '');
+        print STDERR "apip: $why\n";
+        return $status == 404 ? 4 : 1;
+    }
+    if ($o{json} || !$o{columns}) {
+        require File::Raw::JSON;
+        print File::Raw::JSON::file_json_encode($body), "\n" if defined $body;
+        return 0;
+    }
+    _table($body, $o{columns});
+    return 0;
+}
+
+# A plain aligned table. No box drawing: this gets pasted into tickets.
+sub _table {
+    my ($rows, $columns) = @_;
+    $rows = [ $rows ] if ref $rows eq 'HASH';
+    unless (ref $rows eq 'ARRAY' && @$rows) {
+        print "(nothing)\n";
+        return;
+    }
+    my @cols = @$columns;
+    my @width = map { length } @cols;
+    my @out;
+    for my $r (@$rows) {
+        my @cells = map {
+            my $v = $r->{$_};
+            $v = '' unless defined $v;
+            $v = ref $v eq 'ARRAY' ? join(',', @$v)
+               : ref $v            ? ($$v ? 'yes' : 'no')
+               : $v;
+            $v;
+        } @cols;
+        for my $i (0 .. $#cells) {
+            $width[$i] = length $cells[$i] if length $cells[$i] > $width[$i];
+        }
+        push @out, \@cells;
+    }
+    my $fmt = join('  ', map { "%-${_}s" } @width) . "\n";
+    printf $fmt, map { uc } @cols;
+    printf $fmt, @$_ for @out;
+    return;
+}
+
+sub cmd_proxies {
+    my @argv = @_;
+    my $json = _want_json(\@argv);
+    my $sub  = (@argv && $argv[0] !~ /^\d/) ? shift @argv : 'list';
+    my $api  = _remote() or return 2;
+
+    if ($sub eq 'list') {
+        my ($s, $b) = $api->call(GET => '/proxies');
+        return _out($s, $b, json => $json,
+                    columns => [qw(id name host mode published_version)]);
+    }
+    if ($sub eq 'show') {
+        my $id = shift @argv or return _need('apip proxies show PROXY');
+        my ($s, $b) = $api->call(GET => "/proxies/$id");
+        return _out($s, $b, json => $json,
+                    columns => [qw(id name host upstream mode published_version)]);
+    }
+    if ($sub eq 'create') {
+        my $opt = _opts(\@argv, qw(upstream spec url));
+        my $name = shift @argv or return _need(
+            'apip proxies create NAME [--upstream URL] [--spec FILE|--url URL]');
+        my %body = (name => $name);
+        $body{upstream} = $opt->{upstream} if defined $opt->{upstream};
+        $body{url}      = $opt->{url}      if defined $opt->{url};
+        if (defined $opt->{spec}) {
+            my $bytes = _slurp($opt->{spec}) or return 2;
+            $body{spec} = $bytes;
+        }
+        my ($s, $b) = $api->call(POST => '/proxies', json => \%body);
+        return _out($s, $b, json => $json,
+                    columns => [qw(id name host mode published_version)]);
+    }
+    if ($sub eq 'set') {
+        my $opt = _opts(\@argv, qw(name upstream mode));
+        my $id = shift @argv or return _need(
+            'apip proxies set PROXY [--name N] [--upstream URL] [--mode observe|enforce]');
+        return _need('nothing to change') unless %$opt;
+        my ($s, $b) = $api->call(PATCH => "/proxies/$id", json => $opt);
+        return _out($s, $b, json => $json,
+                    columns => [qw(id name host upstream mode)]);
+    }
+    if ($sub eq 'delete') {
+        my $id = shift @argv or return _need('apip proxies delete PROXY');
+        my ($s, $b) = $api->call(DELETE => "/proxies/$id");
+        print "deleted proxy $id\n" if $s == 204;
+        return $s == 204 ? 0 : _out($s, $b, json => $json);
+    }
+    if ($sub eq 'rotate') {
+        my $id = shift @argv or return _need('apip proxies rotate PROXY');
+        my ($s, $b) = $api->call(POST => "/proxies/$id/token");
+        return _out($s, $b, json => $json, columns => [qw(report_token)]);
+    }
+    return _need('apip proxies [list|show|create|set|delete|rotate]');
+}
+
+sub cmd_specs {
+    my @argv = @_;
+    my $json = _want_json(\@argv);
+    my $sub  = (@argv && $argv[0] =~ /^(add|get|publish|diff|list)$/)
+                 ? shift @argv : 'list';
+    my $api  = _remote() or return 2;
+
+    if ($sub eq 'list') {
+        my $id = shift @argv or return _need('apip specs PROXY');
+        my ($s, $b) = $api->call(GET => "/proxies/$id/specs");
+        return _out($s, $b, json => $json,
+                    columns => [qw(id digest size operations published)]);
+    }
+    if ($sub eq 'add') {
+        my $opt = _opts(\@argv, qw(url));
+        my $id = shift @argv or return _need('apip specs add PROXY FILE|--url URL');
+        my %body;
+        if (defined $opt->{url}) { $body{url} = $opt->{url} }
+        else {
+            my $file = shift @argv
+                or return _need('apip specs add PROXY FILE|--url URL');
+            my $bytes = _slurp($file) or return 2;
+            $body{spec} = $bytes;
+        }
+        my ($s, $b) = $api->call(POST => "/proxies/$id/specs", json => \%body);
+        # 200 means the content address recognised these bytes - not an
+        # error, and a CI job re-posting an unchanged document should
+        # not fail because of it.
+        print STDERR "apip: those bytes were already version $b->{id}\n"
+            if $s == 200 && ref $b eq 'HASH' && !$json;
+        return _out($s, $b, json => $json,
+                    columns => [qw(id digest size operations published)]);
+    }
+    if ($sub eq 'get') {
+        my $id = shift @argv or return _need('apip specs get PROXY VERSION');
+        my $v  = shift @argv or return _need('apip specs get PROXY VERSION');
+        my ($s, $b) = $api->call(GET => "/proxies/$id/specs/$v");
+        return _out($s, $b, json => $json) if $s < 200 || $s >= 300;
+        # The document itself, on stdout, byte for byte - so `apip specs
+        # get ... > openapi.json` is a real download.
+        require File::Raw::JSON;
+        print ref $b ? File::Raw::JSON::file_json_encode($b) : $b;
+        print "\n" unless !ref $b && $b =~ /\n\z/;
+        return 0;
+    }
+    if ($sub eq 'publish') {
+        my $id = shift @argv or return _need('apip specs publish PROXY VERSION');
+        my $v  = shift @argv or return _need('apip specs publish PROXY VERSION');
+        my ($s, $b) = $api->call(POST => "/proxies/$id/publish",
+                                 json => { version => 0 + $v });
+        return _out($s, $b, json => $json,
+                    columns => [qw(id name host published_version)]);
+    }
+    if ($sub eq 'diff') {
+        my $id = shift @argv or return _need('apip specs diff PROXY [FROM TO]');
+        my ($from, $to) = (shift @argv, shift @argv);
+        my $q = join '&', grep { defined }
+            (defined $from ? "from=$from" : undef),
+            (defined $to   ? "to=$to"     : undef);
+        my ($s, $b) = $api->call(GET => "/proxies/$id/diff"
+                                       . (length $q ? "?$q" : ''));
+        return _out($s, $b, json => 1) if $json || $s < 200 || $s >= 300;
+        _print_diff($b);
+        return 0;
+    }
+    return _need('apip specs [list|add|get|publish|diff]');
+}
+
+# The diff, as prose. A table would be the wrong shape: what a reader
+# wants is the sentence "these stopped, this started".
+sub _print_diff {
+    my ($d) = @_;
+    printf "contract: #%s -> #%s\n", $d->{from} // '?', $d->{to} // '?';
+    print "  added:    $_\n"   for @{ $d->{added}   || [] };
+    print "  removed:  $_\n"   for @{ $d->{removed} || [] };
+    for my $ch (@{ $d->{changed} || [] }) {
+        print "  changed:  $ch->{operation}\n";
+        print "              - $_\n" for @{ $ch->{notes} || [] };
+    }
+    print "  (no change to what is checked)\n"
+        unless @{ $d->{added} || [] } || @{ $d->{removed} || [] }
+            || @{ $d->{changed} || [] };
+
+    print "\nreality across the boundary:\n";
+    print "  stopped:  $_\n" for @{ $d->{fixed}   || [] };
+    print "  started:  $_\n" for @{ $d->{arrived} || [] };
+    print "  carried:  $_\n" for @{ $d->{carried} || [] };
+    print "  (no drift reported under either version)\n"
+        unless @{ $d->{fixed} || [] } || @{ $d->{arrived} || [] }
+            || @{ $d->{carried} || [] };
+    return;
+}
+
+sub cmd_env {
+    my @argv = @_;
+    my $json = _want_json(\@argv);
+    my $sub  = (@argv && $argv[0] =~ /^(set|rm|list)$/) ? shift @argv : 'list';
+    my $api  = _remote() or return 2;
+
+    if ($sub eq 'list') {
+        my $id = shift @argv or return _need('apip env PROXY');
+        my ($s, $b) = $api->call(GET => "/proxies/$id/environments");
+        return _out($s, $b, json => $json, columns => [qw(name version)]);
+    }
+    if ($sub eq 'set') {
+        my $id   = shift @argv or return _need('apip env set PROXY NAME [VERSION]');
+        my $name = shift @argv or return _need('apip env set PROXY NAME [VERSION]');
+        my $v    = shift @argv;
+        my ($s, $b) = $api->call(POST => "/proxies/$id/environments",
+            json => { name => $name,
+                      (defined $v ? (version => 0 + $v) : ()) });
+        return _out($s, $b, json => $json, columns => [qw(name version)]);
+    }
+    if ($sub eq 'rm') {
+        my $id   = shift @argv or return _need('apip env rm PROXY NAME');
+        my $name = shift @argv or return _need('apip env rm PROXY NAME');
+        my ($s, $b) = $api->call(DELETE => "/proxies/$id/environments/$name");
+        print "removed $name; gateways fall back to the published version\n"
+            if $s == 204;
+        return $s == 204 ? 0 : _out($s, $b, json => $json);
+    }
+    return _need('apip env [list|set|rm]');
+}
+
+sub cmd_violations {
+    my @argv = @_;
+    my $json = _want_json(\@argv);
+    my $opt  = _opts(\@argv, qw(since operation));
+    my $id   = shift @argv or return _need(
+        'apip violations PROXY [--since 24h|7d|friday] [--operation ID]');
+    my $api  = _remote() or return 2;
+
+    my $q = join '&', map { "$_=$opt->{$_}" } sort keys %$opt;
+    my ($s, $b) = $api->call(GET => "/proxies/$id/violations"
+                                   . (length $q ? "?$q" : ''));
+    return _out($s, $b, json => $json,
+                columns => [qw(operation_id status pointer keyword count
+                               sample_count spec_version)]);
+}
+
+sub cmd_coverage {
+    my @argv = @_;
+    my $json = _want_json(\@argv);
+    my $id   = shift @argv or return _need('apip coverage PROXY');
+    my $api  = _remote() or return 2;
+    my ($s, $b) = $api->call(GET => "/proxies/$id/coverage");
+    return _out($s, $b, json => $json,
+                columns => [qw(operation_id total checked unsampled
+                               skip_schema violations divisor)]);
+}
+
+my $USAGE_ALERT_ADD =
+    'apip alert add PROXY NAME --threshold N --window M '
+  . '--channel slack|webhook --target URL [--operation ID]';
+
+# The mock's canned responses: list them, set one, remove one.
+#
+# The body comes from a file or from stdin, never from an argument. An
+# example worth storing is usually a whole JSON document, and a shell
+# argument is the one place it cannot survive intact - quoting mangles
+# it, and the length limit truncates it without saying so.
+sub cmd_examples {
+    my @argv = @_;
+    my $json  = _want_json(\@argv);
+    my $opt   = _opts(\@argv, qw(operation status media-type name));
+    my $usage = 'apip examples set PROXY FILE|- --operation ID --status N '
+              . '[--media-type T] [--name N]';
+    my $sub   = (@argv && $argv[0] =~ /^(set|rm|list)$/) ? shift @argv : 'list';
+    my $api   = _remote() or return 2;
+
+    if ($sub eq 'list') {
+        my $id = shift @argv or return _need('apip examples PROXY');
+        my ($s, $b) = $api->call(GET => "/proxies/$id/examples");
+        return _out($s, $b, json => $json,
+                    columns => [qw(id operation_id status media_type name updated)]);
+    }
+
+    if ($sub eq 'set') {
+        my $id   = shift @argv or return _need($usage);
+        my $file = shift @argv;
+        return _need($usage) unless defined $file;
+        for my $need (qw(operation status)) {
+            return _need($usage) unless defined $opt->{$need};
+        }
+        my $bytes = $file eq '-' ? do { local $/; <STDIN> } : _slurp($file);
+        return 2 unless defined $bytes && length $bytes;
+        my ($s, $b) = $api->call(PUT => "/proxies/$id/examples", json => {
+            operation_id => $opt->{operation},
+            status       => "$opt->{status}",
+            body         => $bytes,
+            (defined $opt->{'media-type'}
+                ? (media_type => $opt->{'media-type'}) : ()),
+            (defined $opt->{name} ? (name => $opt->{name}) : ()),
+        });
+        return _out($s, $b, json => $json,
+                    columns => [qw(id operation_id status media_type name)]);
+    }
+
+    if ($sub eq 'rm') {
+        my $id = shift @argv or return _need('apip examples rm PROXY EXAMPLE');
+        my $e  = shift @argv or return _need('apip examples rm PROXY EXAMPLE');
+        my ($s, $b) = $api->call(DELETE => "/proxies/$id/examples/$e");
+        return _out($s, $b, json => $json) if $s < 200 || $s >= 300;
+        print "deleted\n" unless $json;
+        return 0;
+    }
+
+    return _need('apip examples PROXY [set|rm]');
+}
+
+# The MCP endpoint for AI agents: show it, turn it on or off, and list the
+# operations an agent would be offered.
+#
+# `serving` is reported beside `enabled` because they are different questions.
+# `enabled` is what the owner asked for; `serving` is what the gateway is
+# actually told, which is that AND the plan. A proxy switched on below the
+# Starter plan answers neither, and a CLI that printed only `enabled` would
+# leave somebody debugging an endpoint that was never going to reply.
+sub cmd_mcp {
+    my @argv = @_;
+    my $json = _want_json(\@argv);
+    # Options come out before the positionals, so --ops may sit anywhere;
+    # otherwise `apip mcp --ops a,b PROXY on` reads --ops as the proxy.
+    my $opt  = _opts(\@argv, qw(ops));
+    my $api  = _remote() or return 2;
+
+    my $id = shift @argv or return _need('apip mcp PROXY [on|off|tools]');
+    my $sub = (@argv && $argv[0] =~ /^(on|off|tools)$/) ? shift @argv : 'show';
+
+    if ($sub eq 'tools') {
+        my ($s, $b) = $api->call(GET => "/proxies/$id/mcp/tools");
+        return _out($s, $b, json => $json,
+                    columns => [qw(operation_id method path offered gone summary)]);
+    }
+
+    if ($sub eq 'on' || $sub eq 'off') {
+        my %body = (enabled => ($sub eq 'on' ? \1 : \0));
+        # --ops takes a comma-separated list of operationIds; --ops '' clears
+        # the selection back to every operation, which is the default.
+        if (defined $opt->{ops}) {
+            $body{ops} = [ grep { length } split /\s*,\s*/, $opt->{ops} ];
+        }
+        my ($s, $b) = $api->call(PATCH => "/proxies/$id/mcp", json => \%body);
+        return _out($s, $b, json => $json,
+                    columns => [qw(enabled serving oauth ops url)]);
+    }
+
+    my ($s, $b) = $api->call(GET => "/proxies/$id/mcp");
+    return _out($s, $b, json => $json,
+                columns => [qw(enabled serving oauth ops url metadata_url)]);
+}
+
+sub cmd_alert {
+    my @argv = @_;
+    my $json = _want_json(\@argv);
+    my $sub  = (@argv && $argv[0] =~ /^(add|rm|silence|enable|list)$/)
+                 ? shift @argv : 'list';
+    my $api  = _remote() or return 2;
+
+    if ($sub eq 'list') {
+        my $id = shift @argv or return _need('apip alert PROXY');
+        my ($s, $b) = $api->call(GET => "/proxies/$id/alerts");
+        return _out($s, $b, json => $json,
+                    columns => [qw(id name operation_id threshold window_min
+                                   channel enabled state)]);
+    }
+    if ($sub eq 'add') {
+        my $opt = _opts(\@argv, qw(threshold window channel target operation));
+        my $id   = shift @argv or return _need($USAGE_ALERT_ADD);
+        my $name = shift @argv or return _need($USAGE_ALERT_ADD);
+        for my $need (qw(threshold window channel target)) {
+            return _need($USAGE_ALERT_ADD) unless defined $opt->{$need};
+        }
+        my ($s, $b) = $api->call(POST => "/proxies/$id/alerts", json => {
+            name       => $name,
+            threshold  => 0 + $opt->{threshold},
+            window_min => 0 + $opt->{window},
+            channel    => $opt->{channel},
+            target     => $opt->{target},
+            (defined $opt->{operation}
+                ? (operation_id => $opt->{operation}) : ()),
+        });
+        return _out($s, $b, json => $json,
+                    columns => [qw(id name threshold window_min channel state)]);
+    }
+    if ($sub eq 'silence' || $sub eq 'enable') {
+        my $id = shift @argv or return _need("apip alert $sub PROXY ALERT");
+        my $a  = shift @argv or return _need("apip alert $sub PROXY ALERT");
+        my ($s, $b) = $api->call(PATCH => "/proxies/$id/alerts/$a",
+            json => { enabled => ($sub eq 'enable' ? \1 : \0) });
+        return _out($s, $b, json => $json,
+                    columns => [qw(id name enabled state)]);
+    }
+    if ($sub eq 'rm') {
+        my $id = shift @argv or return _need('apip alert rm PROXY ALERT');
+        my $a  = shift @argv or return _need('apip alert rm PROXY ALERT');
+        my ($s, $b) = $api->call(DELETE => "/proxies/$id/alerts/$a");
+        print "removed alert $a\n" if $s == 204;
+        return $s == 204 ? 0 : _out($s, $b, json => $json);
+    }
+    return _need('apip alert [list|add|rm|silence|enable]');
+}
+
+# Which command reaches which operation of the management API. Printed
+# rather than merely known, because the parity test reads it - and
+# because "can the CLI do X" is a question an operator should be able to
+# answer without reading source.
+sub cmd_operations {
+    require Maat::Remote;
+    print "$_\n" for Maat::Remote->coverage_lines;
+    return 0;
+}
+
+sub _need {
+    my ($usage) = @_;
+    print STDERR "usage: $usage\n";
+    return 2;
+}
+
+sub _slurp {
+    my ($file) = @_;
+    open my $fh, '<:raw', $file or do {
+        print STDERR "apip: cannot read $file: $!\n";
+        return;
+    };
+    local $/;
+    my $bytes = <$fh>;
+    close $fh;
+    return $bytes;
+}
+
+sub usage {
+    return <<'USAGE';
+usage: apip COMMAND [apip.yml]
+
+  run      serve the gateway - one tenant, from apip.yml
+  check    validate the configuration, compile the spec and probe the
+           upstream; exits non-zero if anything would stop it serving
+  explain  what will be checked for one operation, and what will happen
+           to a request that fails it:
+               apip explain GET /orders/{id}
+               apip explain getOrder
+  tail     the live violation feed, as it happens:
+               apip tail --violations
+               apip tail --json --once
+  revoke   force a revoked key to stop working at once, rather than at
+           the next bundle poll, by signalling the running gateway to
+           re-poll now:
+               apip revoke <key-id> --pid 12345
+               apip revoke <key-id> --pidfile /run/maat.pid
+  help     this text
+
+The control plane, from a terminal. These need APIP_TOKEN (an account
+token, issued on the account page) and talk to https://openapi-proxy.com
+unless APIP_API says otherwise. Add --json to any of them for the
+response as it came.
+
+  proxies    list, show, create, set, delete, rotate
+  specs      list, add, get, publish, diff
+  env        list, set, rm          - named pointers at spec versions
+  violations the drift report:  apip violations 42 --since friday
+  coverage   how much traffic was actually weighed
+  alert      list, add, rm, silence, enable
+  operations which command reaches which API operation
+
+Everything the console does is here. That is a house rule, not a
+coincidence: a write action that exists only in a browser is one you
+cannot perform at 3am, and the build fails if the API grows an operation
+no command reaches.
+
+  apip.yml:
+
+      upstream: https://api.internal:8443   # required
+      spec:     ./openapi.json              # required
+      mode:     observe                     # observe | enforce
+      listen:
+        - { port: 80,  redirect_https: 443 }
+        - { port: 443, tls_cert: tls/server.crt, tls_key: tls/server.key }
+      responses:
+        sample:   adaptive                  # adaptive | all | N
+        budget:   50                        # validated/second/operation
+        floor:    10                        # at least one every N seconds
+        max_body: 1M
+
+  Any value may be written { $env: NAME } or { $file: path } instead of
+  a literal, so a token never has to live in the file.
+
+  A response is weighed against the schema its status declares and is
+  never altered, in either mode - see `apip explain`.
+
+  Violations are aggregated by fingerprint and one record per window is
+  spooled and shipped, so a million identical failures are six records a
+  minute rather than a million. `apip tail` reads that spool.
+
+environment:
+
+  APIP_CHAOS   inject the failures the request path is written to
+               survive, to prove it stays open: freed, match, alloc,
+               validate, response, record, block, or `all`. Each takes a
+               rate - `validate:0.1` fires on one request in ten.
+USAGE
+}

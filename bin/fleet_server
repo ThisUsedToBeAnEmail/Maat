@@ -1,0 +1,381 @@
+#!/usr/bin/env perl
+
+# The data plane, up: one gateway fleet, backgrounded, on a box that has
+# no service manager.
+#
+#     bin/fleet_server              start, or restart if already up
+#     bin/fleet_server start
+#     bin/fleet_server restart      replace the process - this is the deploy
+#     bin/fleet_server stop
+#     bin/fleet_server status
+#     bin/fleet_server check        the preflight on its own, for a pipeline
+#     bin/fleet_server run          the fleet in the foreground
+#
+# The sibling of openapi-proxy.com's bin/prod_server, and deliberately
+# its shape: same commands, same pid and log conventions, same
+# KEY=value environment file, so an operator holding both boxes types
+# the same things at each. That script manages the control plane's web
+# tier and queue worker; this one manages the data plane, which is one
+# process and needs no database.
+#
+# There is no daemon manager here, on purpose. Under systemd, runit or a
+# container, use `run` as a foreground unit and let the supervisor
+# supervise - examples/apip-fleet.service is that unit, and it is the
+# better answer on a box that has systemd. This script is for the box
+# that does not, and for a human who wants one thing to type.
+#
+# Restart, never reload, and the distinction is sharper here than on the
+# control plane. Hyperman's SIGHUP recycles workers by forking from the
+# supervisor, which is holding the registry as it was at boot - so a HUP
+# throws away every compiled spec AND reverts each new worker to the
+# boot-time tenant table until its own poll comes round. It also cannot
+# pick up a renewed certificate, since the SSL_CTX is built once before
+# the first fork. There is no reload command for that reason.
+
+use strict;
+use warnings;
+use FindBin ();
+use POSIX ();
+
+# Installed, this file and apip-fleet land in the same bin directory;
+# in a checkout they are both in bin/. Either way the server is beside
+# the manager, which beats finding a different one on PATH than the one
+# that shipped with this Maat.
+my $FLEET = "$FindBin::Bin/apip-fleet";
+unshift @INC, "$FindBin::Bin/../lib" if -d "$FindBin::Bin/../lib";
+
+# Before anything reads a path or a token out of the environment: every
+# command wants it, and `run` is a re-exec of this same file that would
+# otherwise resolve its configuration differently from the parent that
+# started it.
+load_env();
+
+my $CONFIG  = $ENV{MAAT_FLEET_CONFIG}  || '/etc/maat/fleet.yml';
+my $RUN_DIR = $ENV{MAAT_FLEET_RUN_DIR} || '/var/run/maat';
+my $LOG_DIR = $ENV{MAAT_FLEET_LOG_DIR} || '/var/log/maat';
+
+# The perl everything runs under. $^X is right whenever this script was
+# started by the perl Maat is installed under - but a box with a system
+# perl beside a built one resolves `#!/usr/bin/env perl` to whichever is
+# first on PATH, and the failure that follows is a fleet exiting with
+# "Can't locate Maat/Fleet.pm" from a Maat that is very much installed.
+my $PERL = $ENV{MAAT_FLEET_PERL} || $^X;
+
+# How long to wait for the process to go after SIGTERM. Hyperman drains
+# in-flight requests within its shutdown_grace; this is the outer bound.
+my $STOP_WAIT = $ENV{MAAT_FLEET_STOP_WAIT} || 45;
+
+my %SERVICE = (
+    fleet => {
+        pid  => "$RUN_DIR/fleet.pid",
+        log  => "$LOG_DIR/fleet.log",
+        # Through apip-fleet rather than through this file: it is the
+        # server, this is the manager, and a restart should pick up new
+        # code by exec rather than by forking a parent that already
+        # compiled the old.
+        argv => [ $PERL, $FLEET, 'run', $CONFIG ],
+    },
+);
+
+# The dispatch is the LAST statement in this file, and it has to be: a
+# file-scope `my` is a runtime assignment, so anything declared below a
+# dispatch that ran here would still be empty when a command reached for
+# it.
+
+sub main {
+    my $cmd = shift(@ARGV) // 'up';
+    my %run = (
+        up    => \&cmd_up,    start  => \&cmd_start,
+        restart => \&cmd_restart,
+        stop  => \&cmd_stop,  status => \&cmd_status,
+        check => \&cmd_check, run    => \&cmd_run,
+    );
+    my $run = $run{$cmd} or die usage();
+    return $run->() || 0;
+}
+
+sub usage {
+    return <<"USAGE";
+usage: fleet_server [command]
+
+  (none)    start, or restart if already running
+  start     start it if it is not running
+  restart   stop and start - this is the deploy, and what a renewed
+            certificate needs
+  stop      stop it, gracefully
+  status    whether it is running, and what it would serve
+  check     the preflight alone: resolve the configuration, fetch and
+            verify one bundle, and say whether the certificate covers
+            the hostnames in it. Non-zero for anything that would stop
+            the process serving, so it belongs in a pipeline.
+  run       the fleet in the foreground (for systemd, runit, docker)
+
+  MAAT_FLEET_CONFIG     $CONFIG
+  MAAT_FLEET_ENV_FILE   /etc/maat/fleet.env
+  MAAT_FLEET_RUN_DIR    $RUN_DIR
+  MAAT_FLEET_LOG_DIR    $LOG_DIR
+
+There is no reload. A recycle forks workers from a supervisor holding
+the boot-time registry, so it discards every compiled spec, reverts each
+worker's tenant table until its own poll, and cannot pick up a renewed
+certificate at all. Restart is the honest operation.
+USAGE
+}
+
+# ---- the environment --------------------------------------------------------
+
+# An optional file of KEY=value lines - the registry token, and whatever
+# else fleet.yml reads through { \$env: NAME }. Deliberately simple: no
+# interpolation, no export keyword, no multi-line values. A line that is
+# not KEY=value is a fatal typo rather than a silently skipped secret.
+sub load_env {
+    my $file = $ENV{MAAT_FLEET_ENV_FILE} || '/etc/maat/fleet.env';
+    return unless -e $file;
+    open my $fh, '<', $file or die "fleet_server: cannot read $file: $!\n";
+    my $line = 0;
+    while (<$fh>) {
+        $line++;
+        next if /\A\s*(?:#|\z)/;
+        my ($k, $v) = /\A\s*([A-Za-z_][A-Za-z_0-9]*)\s*=\s*(.*?)\s*\z/
+            or die "fleet_server: $file line $line is not KEY=value\n";
+        $v =~ s/\A(['"])(.*)\1\z/$2/;
+        # A variable already in the environment wins: an operator saying
+        # MAAT_FLEET_CONFIG=/tmp/x.yml fleet_server means it.
+        $ENV{$k} = $v unless exists $ENV{$k};
+    }
+    close $fh;
+    return;
+}
+
+# ---- preflight --------------------------------------------------------------
+
+# Everything worth failing on while the message is still on somebody's
+# terminal rather than in a log file nobody is tailing.
+#
+# The bundle poll is part of it, and that is the difference between this
+# preflight and prod_server's: there, the control plane may legitimately
+# be down at that moment, because the command is about to start it.
+# Here it is a remote service that must already be up, and a fleet that
+# cannot reach it has nothing to serve.
+sub preflight {
+    my ($quiet) = @_;
+
+    -r $CONFIG or die "fleet_server: $CONFIG is not readable.\n"
+        . "Copy examples/fleet.yml to it, or set MAAT_FLEET_CONFIG.\n";
+
+    -x $FLEET or die "fleet_server: $FLEET is not there.\n"
+        . "apip-fleet ships with this distribution and installs beside "
+        . "this script.\n";
+
+    for my $dir ($RUN_DIR, $LOG_DIR) {
+        next if -d $dir;
+        _mkpath($dir) or die "fleet_server: cannot create $dir: $!\n";
+    }
+
+    # Binding 80 and 443 needs root or CAP_NET_BIND_SERVICE. Saying so
+    # here beats a supervisor that dies with EACCES in a log file - and
+    # a fleet wants :80 whatever else it has, since that is where a
+    # custom domain's ACME challenge is answered.
+    my $config = eval { require Maat::Fleet; Maat::Fleet->load($CONFIG) };
+    unless ($config) {
+        my $why = $@ || 'unknown error';
+        $why =~ s/ at \S+ line \d+\.?\s*\z//;
+        die "fleet_server: $CONFIG will not load:\n\n  $why\n";
+    }
+    my @low = grep { $_ < 1024 } map { $_->{port} } @{ $config->{listen} };
+    die "fleet_server: ports @low need root or CAP_NET_BIND_SERVICE, and "
+      . "this is uid $<\n"
+        if @low && $< != 0;
+
+    # And the whole of what a starting worker depends on: the token, the
+    # network path, the signature, the bundle, the certificate. Delegated
+    # to `apip-fleet check` so there is one implementation of it and a
+    # pipeline running that command sees exactly what this does.
+    my @cmd = ($PERL, $FLEET, 'check', $CONFIG);
+    if ($quiet) {
+        my $out = qx{@cmd 2>&1};
+        return if $? == 0;
+        $out =~ s/\s+\z//;
+        die "fleet_server: the preflight failed, so nothing was started:\n\n"
+          . "$out\n";
+    }
+    system(@cmd) == 0
+        or die "fleet_server: the preflight failed, so nothing was "
+             . "started.\n";
+    return;
+}
+
+sub _mkpath {
+    my ($dir) = @_;
+    my $path = '';
+    for my $p (split m{/}, $dir) {
+        $path .= "$p/";
+        next if -d $path;
+        mkdir $path or return 0;
+    }
+    return 1;
+}
+
+# ---- process bookkeeping ----------------------------------------------------
+
+sub pid_of {
+    my ($name) = @_;
+    open my $fh, '<', $SERVICE{$name}{pid} or return;
+    my $pid = <$fh>;
+    close $fh;
+    ($pid) = ($pid // '') =~ /\A(\d+)/ or return;
+    # A pid file outliving its process is normal after a crash or a
+    # reboot; treat it as absent rather than as a running service.
+    return $pid if kill 0, $pid;
+    unlink $SERVICE{$name}{pid};
+    return;
+}
+
+sub start_one {
+    my ($name) = @_;
+    my $s = $SERVICE{$name};
+    if (my $pid = pid_of($name)) {
+        print "  $name already running (pid $pid)\n";
+        return 0;
+    }
+
+    my $pid = fork;
+    defined $pid or die "fleet_server: cannot fork for $name: $!\n";
+    if (!$pid) {
+        # Its own session, so a closed terminal does not take the
+        # gateway with it, and signals to this script's process group do
+        # not reach it.
+        POSIX::setsid();
+        open STDIN,  '<', '/dev/null';
+        open STDOUT, '>>', $s->{log} or die "cannot open $s->{log}: $!\n";
+        open STDERR, '>&', \*STDOUT;
+        select STDOUT; $| = 1;
+        exec @{ $s->{argv} }
+            or die "fleet_server: cannot exec $s->{argv}[1]: $!\n";
+    }
+
+    open my $fh, '>', $s->{pid}
+        or die "fleet_server: cannot write $s->{pid}: $!\n";
+    print {$fh} "$pid\n";
+    close $fh;
+
+    # A process that exits immediately - a port already taken, a
+    # certificate that moved - should be reported here and not left as a
+    # stale pid file.
+    #
+    # waitpid before the liveness check, and that is the whole trick: the
+    # child is still ours, so a dead one is a zombie until it is reaped,
+    # and `kill 0` on a zombie succeeds. Without this, every failure to
+    # start reads as a successful start.
+    #
+    # Two seconds rather than one: apip-fleet polls the control plane
+    # before it binds anything, and a round trip to another host is the
+    # difference between reporting a real failure and reporting a
+    # perfectly healthy start as a dead one.
+    sleep 2;
+    my $reaped = waitpid $pid, POSIX::WNOHANG();
+    if ($reaped == $pid || !kill 0, $pid) {
+        unlink $s->{pid};
+        die "fleet_server: $name exited immediately. Last of $s->{log}:\n"
+          . _tail($s->{log}, 20);
+    }
+    print "  $name started (pid $pid), logging to $s->{log}\n";
+    return 1;
+}
+
+sub stop_one {
+    my ($name) = @_;
+    my $pid = pid_of($name) or do {
+        print "  $name not running\n";
+        return 0;
+    };
+    kill 'TERM', $pid;
+    for (1 .. $STOP_WAIT) {
+        unless (kill 0, $pid) {
+            unlink $SERVICE{$name}{pid};
+            print "  $name stopped\n";
+            return 1;
+        }
+        sleep 1;
+    }
+    # Not escalating to KILL on our own initiative: it drains in-flight
+    # requests on TERM, and those are customers' requests to customers'
+    # upstreams. Say so and let a human decide.
+    print "  $name did not stop within ${STOP_WAIT}s (pid $pid still up).\n"
+        . "  It is draining, or it is stuck. `kill -9 $pid` if you are sure.\n";
+    return 0;
+}
+
+sub _tail {
+    my ($file, $n) = @_;
+    open my $fh, '<', $file or return "  (no log at $file)\n";
+    my @lines = <$fh>;
+    close $fh;
+    @lines = @lines[-$n .. -1] if @lines > $n;
+    return join '', map { "  | $_" } @lines;
+}
+
+# ---- commands ---------------------------------------------------------------
+
+sub cmd_up { return pid_of('fleet') ? cmd_restart() : cmd_start() }
+
+sub cmd_start {
+    preflight(1);
+    print "starting:\n";
+    start_one('fleet');
+    return 0;
+}
+
+sub cmd_restart {
+    # Before stopping anything: a deploy that cannot fetch a bundle
+    # should leave the running fleet alone, serving its last good one.
+    preflight(1);
+    print "stopping:\n";
+    stop_one('fleet');
+    print "starting:\n";
+    start_one('fleet');
+    return 0;
+}
+
+sub cmd_stop {
+    print "stopping:\n";
+    stop_one('fleet');
+    return 0;
+}
+
+sub cmd_check {
+    preflight(0);
+    return 0;
+}
+
+sub cmd_status {
+    my $pid = pid_of('fleet');
+    printf "  %-7s %s\n", 'fleet',
+        $pid ? "running (pid $pid)" : 'NOT RUNNING';
+    printf "  %-7s %s\n", 'config', $CONFIG;
+
+    my $config = eval { require Maat::Fleet; Maat::Fleet->load($CONFIG) };
+    unless ($config) {
+        printf "  %-7s %s\n", 'listen', "$CONFIG will not load - `check` it";
+        return 1;
+    }
+    printf "  %-7s %s\n", 'listen', join ', ',
+        map { ($_->{host} || '0.0.0.0') . ':' . $_->{port}
+            . ($_->{tls_cert} ? ' https' : ' plain') } @{ $config->{listen} };
+    printf "  %-7s %s\n", 'control', $config->{control_plane};
+    printf "  %-7s %s\n", 'pool', defined $config->{pool}
+        ? $config->{pool}
+        : 'every tenant in the bundle (no shard configured)';
+    printf "  %-7s %s\n", 'log', $SERVICE{fleet}{log};
+    return $pid ? 0 : 1;
+}
+
+# The foreground process, exposed as a command so a real service manager
+# can run it directly, and used by start_one through exec so that a
+# restart picks up new code.
+sub cmd_run {
+    exec $PERL, $FLEET, 'run', $CONFIG
+        or die "fleet_server: cannot exec $FLEET: $!\n";
+}
+
+exit main();

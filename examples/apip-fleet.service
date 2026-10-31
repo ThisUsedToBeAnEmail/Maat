@@ -1,0 +1,72 @@
+# The hosted data plane, as a systemd unit.
+#
+#   cp examples/apip-fleet.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now apip-fleet
+#
+# `apip-fleet run` is a foreground process that keeps its supervisor in
+# the foreground, which is what a service manager wants: no pid file, no
+# double fork, no daemonising of its own. Everything below is systemd
+# doing the parts a hand-rolled supervisor script would have to
+# reimplement - restart on failure, start at boot, journald.
+
+[Unit]
+Description=openapi-proxy.com data plane (apip-fleet)
+Documentation=man:Maat::Fleet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# The registry token, and anything else the fleet.yml reads through
+# { $env: NAME }. Root-owned, 0600: it authenticates the bundle feed and
+# is the HMAC key that feed is verified with, and the bundle carries
+# customers' private keys.
+EnvironmentFile=/etc/maat/fleet.env
+
+ExecStartPre=/usr/local/bin/apip-fleet check /etc/maat/fleet.yml
+ExecStart=/usr/local/bin/apip-fleet run /etc/maat/fleet.yml
+
+# A fleet worker that dies takes customer traffic with it, so it comes
+# back - but not in a tight loop against a control plane that is down.
+Restart=always
+RestartSec=5
+
+# SIGTERM drains: Hyperman stops accepting, lets in-flight requests
+# finish, and exits within its shutdown_grace. Give it room to.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+# SIGHUP is deliberately NOT wired to `systemctl reload`. Hyperman's HUP
+# recycles workers by forking from the supervisor, which is holding the
+# registry as it was at boot - so a reload would throw away every
+# compiled spec and every bundle applied since, and each new worker
+# would serve the boot-time tenant table until its own poll came round.
+# A restart is the honest operation, and it is also what a renewed
+# certificate needs, since the SSL_CTX is built once before the first
+# fork.
+
+# Ports 80 and 443 without running as root. The private keys the bundle
+# brings are written under tls_dir at 0600 and must be readable by this
+# user and nobody else.
+User=maat
+Group=maat
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+StateDirectory=maat
+ReadWritePaths=/var/lib/maat
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=apip-fleet
+
+[Install]
+WantedBy=multi-user.target
